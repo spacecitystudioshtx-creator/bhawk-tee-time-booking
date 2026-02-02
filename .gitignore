@@ -1,0 +1,30 @@
+# Environment and credentials
+.env
+env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Debug files
+*.png
+*.html
+
+# Logs
+*.log

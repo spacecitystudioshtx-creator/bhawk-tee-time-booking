@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/bin/activate)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(ssh:*)",
+      "Bash(sshpass -p '::m7Pp@G2fV%=b' ssh -o StrictHostKeyChecking=no root@159.89.41.54 \"echo ''Connected!'' && uname -a\")",
+      "Bash(brew install:*)",
+      "Bash(sshpass -p '::m7Pp@G2fV%=b' ssh -o StrictHostKeyChecking=no root@159.89.41.54 \"mkdir -p ~/.ssh && echo ''ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJBLdUkeXyk4HNG13Nt3ETsfPQi0NsdP1mvCIzbC99fR alexdimitroff@tee-time-booking'' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo ''SSH key added successfully!''\")",
+      "Bash(scp:*)"
+    ]
+  }
+}
