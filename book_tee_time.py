@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Black Hawk Country Club Tee Time Booking Automation
-Books Saturday tee times between 9-10 AM when they open at 7 AM Friday (8 days ahead)
+Books Sunday tee times between 9-10 AM when they open at 7 AM Saturday (8 days ahead)
 Uses undetected-chromedriver to bypass bot detection
 """
 
@@ -38,7 +38,7 @@ TARGET_TIME_START = 9  # 9 AM
 TARGET_TIME_END = 10.5   # 10:30 AM
 BOOKING_HOUR = 7  # Tee times open at 7 AM
 BOOKING_MINUTE = 0
-DAYS_AHEAD = 8  # Book 8 days in advance (Friday -> next Saturday)
+DAYS_AHEAD = 8  # Book 8 days in advance (Saturday -> next Sunday)
 
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
@@ -75,17 +75,17 @@ def log(message):
 
 def calculate_target_date():
     """
-    Calculate the target Saturday date (8 days from now).
-    This script runs on Friday, booking for the following Saturday.
+    Calculate the target Sunday date (8 days from now).
+    This script runs on Saturday, booking for the following Sunday.
     """
     today = datetime.now()
     # Target is 8 days from now (should be Saturday when run on Friday)
     target = today + timedelta(days=DAYS_AHEAD)
 
-    # Verify it's a Saturday (weekday 5)
-    if target.weekday() != 5:
-        log(f"WARNING: Target date {target.strftime('%A, %B %d, %Y')} is not a Saturday!")
-        log(f"Today is {today.strftime('%A')}. Script should run on Friday.")
+    # Verify it's a Sunday (weekday 6)
+    if target.weekday() != 6:
+        log(f"WARNING: Target date {target.strftime('%A, %B %d, %Y')} is not a Sunday!")
+        log(f"Today is {today.strftime('%A')}. Script should run on Saturday.")
 
     return target
 

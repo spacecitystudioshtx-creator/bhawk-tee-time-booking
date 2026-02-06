@@ -7,7 +7,7 @@
 #   1. Installs Google Chrome (required by undetected-chromedriver)
 #   2. Creates a Python virtual environment and installs dependencies
 #   3. Creates logs/ and screenshots/ directories
-#   4. Installs the cron job to run every Friday at 6:50 AM
+#   4. Installs the cron job to run every Saturday at 6:50 AM
 
 set -euo pipefail
 
@@ -65,8 +65,8 @@ chown -R "$CRON_USER":"$CRON_USER" "$SCRIPT_DIR/logs" "$SCRIPT_DIR/screenshots" 
 # --- 4. Install cron job ---
 echo "[4/4] Installing cron job..."
 
-# The cron entry: run every Friday at 6:50 AM (10 min before 7 AM booking opens)
-CRON_CMD="50 6 * * 5 $SCRIPT_DIR/run_booking.sh"
+# The cron entry: run every Saturday at 6:50 AM (10 min before 7 AM booking opens)
+CRON_CMD="50 6 * * 6 $SCRIPT_DIR/run_booking.sh"
 
 # Check if cron job already exists for this user
 EXISTING_CRON=$(crontab -u "$CRON_USER" -l 2>/dev/null || true)
@@ -81,7 +81,7 @@ fi
 echo ""
 echo "=== Setup Complete ==="
 echo ""
-echo "Cron schedule: Every Friday at 6:50 AM"
+echo "Cron schedule: Every Saturday at 6:50 AM"
 echo "  The script will wait until exactly 7:00 AM to search for tee times."
 echo ""
 echo "Logs:        $SCRIPT_DIR/logs/"
