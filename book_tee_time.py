@@ -8,6 +8,7 @@ Uses undetected-chromedriver to bypass bot detection
 import os
 import sys
 import time
+import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import undetected_chromedriver as uc
@@ -17,8 +18,17 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
+# Resolve paths relative to this script's location
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, 'logs')
+SCREENSHOT_DIR = os.path.join(SCRIPT_DIR, 'screenshots')
+
+# Create directories if they don't exist
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(SCRIPT_DIR, '.env'))
 
 # Configuration
 USERNAME = os.getenv('BHCC_USERNAME', 'alexander.dimitroff')
@@ -33,10 +43,35 @@ DAYS_AHEAD = 8  # Book 8 days in advance (Friday -> next Saturday)
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
 
+def setup_logging():
+    """Configure logging to both console and a dated log file"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    log_file = os.path.join(LOG_DIR, f'booking_{today_str}.log')
+
+    logger = logging.getLogger('bhawk_booking')
+    logger.setLevel(logging.INFO)
+
+    # Avoid adding duplicate handlers on re-import
+    if not logger.handlers:
+        formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+        # Console handler
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(formatter)
+        logger.addHandler(console)
+
+        # File handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+_logger = setup_logging()
+
 def log(message):
-    """Print timestamped log message"""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {message}")
+    """Print timestamped log message to console and log file"""
+    _logger.info(message)
 
 def calculate_target_date():
     """
@@ -78,6 +113,15 @@ def wait_until_booking_time():
         time.sleep(0.01)  # 10ms precision
 
     log(f"It's {BOOKING_HOUR}:00 AM - GO!")
+
+def save_screenshot(driver, name):
+    """Save a screenshot with timestamp to the screenshots directory"""
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    filename = f'{name}_{timestamp}.png'
+    filepath = os.path.join(SCREENSHOT_DIR, filename)
+    driver.save_screenshot(filepath)
+    log(f"Screenshot saved: {filepath}")
+    return filepath
 
 def wait_and_click(driver, by, value, timeout=30):
     """Wait for element and click it"""
@@ -147,6 +191,7 @@ def book_tee_time():
         log("Submitting login...")
         wait_and_click(driver, By.CSS_SELECTOR, 'button#login_submit_main[name="MemEnter"]')
         time.sleep(4)
+        save_screenshot(driver, 'after_login')
 
         # Step 3: Open menu
         log("Opening navigation menu...")
@@ -257,6 +302,9 @@ def book_tee_time():
             log("Warning: Tee time elements took longer than expected to load, continuing anyway...")
             time.sleep(5)
 
+        # Screenshot the search results for debugging
+        save_screenshot(driver, 'search_results')
+
         # Step 7: Find and click View for first available time between 9-10 AM
         log(f"Looking for tee times between {TARGET_TIME_START}:00 AM and {TARGET_TIME_END}:00 AM...")
 
@@ -289,7 +337,7 @@ def book_tee_time():
 
         if not found_time:
             log("ERROR: No available tee times found in the target window!")
-            driver.save_screenshot('no_times_available.png')
+            save_screenshot(driver, 'no_times_available')
             return False
 
         # Step 8: Handle popup - click Continue
@@ -328,26 +376,24 @@ def book_tee_time():
 
         if 'reservation complete' in page_content or 'confirmation' in page_content or 'thank you' in page_content:
             log("SUCCESS! Tee time reservation completed!")
-            driver.save_screenshot('reservation_confirmation.png')
-            log("Confirmation screenshot saved as: reservation_confirmation.png")
+            save_screenshot(driver, 'reservation_confirmation')
             return True
         else:
             log("WARNING: Reservation may not have completed. Please check manually.")
-            driver.save_screenshot('final_page.png')
-            log("Final page screenshot saved as: final_page.png")
+            save_screenshot(driver, 'final_page')
             return False
 
     except TimeoutException as e:
         log(f"ERROR: Timeout occurred - {str(e)}")
-        driver.save_screenshot('error_timeout.png')
+        save_screenshot(driver, 'error_timeout')
         return False
     except Exception as e:
         log(f"ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         try:
-            driver.save_screenshot('error_exception.png')
-        except:
+            save_screenshot(driver, 'error_exception')
+        except Exception:
             pass
         return False
     finally:

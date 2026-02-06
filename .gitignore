@@ -23,8 +23,10 @@ __pycache__/
 .LSOverride
 
 # Debug files
-*.png
 *.html
 
-# Logs
-*.log
+# Logs and screenshots (contents ignored, dirs kept via .gitkeep)
+logs/*
+!logs/.gitkeep
+screenshots/*
+!screenshots/.gitkeep
