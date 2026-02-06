@@ -31,7 +31,7 @@ BOOKING_MINUTE = 0
 DAYS_AHEAD = 8  # Book 8 days in advance (Friday -> next Saturday)
 
 # Set to True when running on server (headless mode)
-HEADLESS = os.getenv('HEADLESS', 'false').lower() == 'true'
+HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
 
 def log(message):
     """Print timestamped log message"""
