@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Black Hawk Country Club Tee Time Booking Automation
-Books Sunday tee times between 9-10 AM when they open at 7 AM Saturday (8 days ahead)
-Uses undetected-chromedriver to bypass bot detection
+Books tee times between 9-10:30 AM when they open at 7 AM (8 days ahead)
+Reads target dates from booking_config.json — runs daily, only books when scheduled.
+Uses undetected-chromedriver to bypass bot detection.
 """
 
 import os
 import sys
 import time
+import json
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -38,10 +40,23 @@ TARGET_TIME_START = 9  # 9 AM
 TARGET_TIME_END = 10.5   # 10:30 AM
 BOOKING_HOUR = 7  # Tee times open at 7 AM
 BOOKING_MINUTE = 0
-DAYS_AHEAD = 8  # Book 8 days in advance (Saturday -> next Sunday)
+DAYS_AHEAD = 8  # Book 8 days in advance
 
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
+
+# Config file for scheduled target dates (shared via /logs/ volume)
+CONFIG_FILE = os.path.join(LOG_DIR, 'booking_config.json')
+
+def load_booking_config():
+    """Load booking configuration from shared config file"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            log(f"Warning: Could not read config file: {e}")
+    return None
 
 def setup_logging():
     """Configure logging to both console and a dated log file"""
@@ -74,20 +89,31 @@ def log(message):
     _logger.info(message)
 
 def calculate_target_date():
-    """
-    Calculate the target Sunday date (8 days from now).
-    This script runs on Saturday, booking for the following Sunday.
-    """
+    """Calculate the target date (DAYS_AHEAD days from now)."""
     today = datetime.now()
-    # Target is 8 days from now (should be Saturday when run on Friday)
     target = today + timedelta(days=DAYS_AHEAD)
-
-    # Verify it's a Sunday (weekday 6)
-    if target.weekday() != 6:
-        log(f"WARNING: Target date {target.strftime('%A, %B %d, %Y')} is not a Sunday!")
-        log(f"Today is {today.strftime('%A')}. Script should run on Saturday.")
-
     return target
+
+def should_book_today():
+    """
+    Check if today is a scheduled booking day.
+    Returns the target date if we should book, or None to skip.
+    """
+    target = calculate_target_date()
+    target_str = target.strftime('%Y-%m-%d')
+    config = load_booking_config()
+
+    if config and 'target_dates' in config:
+        if target_str in config['target_dates']:
+            log(f"Scheduled booking found: {target_str} ({target.strftime('%A')})")
+            return target
+        else:
+            log(f"No booking scheduled for {target_str} ({target.strftime('%A')}). Skipping.")
+            return None
+    else:
+        # No config file — fall back to always booking (legacy behavior)
+        log(f"No config file found. Booking for {target_str} ({target.strftime('%A')}).")
+        return target
 
 def wait_until_booking_time():
     """
@@ -141,7 +167,11 @@ def book_tee_time():
     """Main function to book tee time"""
     log("Starting tee time booking automation...")
 
-    target_date = calculate_target_date()
+    target_date = should_book_today()
+    if target_date is None:
+        log("Nothing to book today. Exiting.")
+        return True  # Not an error, just no booking scheduled
+
     log(f"Target date: {target_date.strftime('%A, %B %d, %Y')}")
 
     # Configure undetected Chrome
@@ -407,6 +437,12 @@ def main():
     log("Black Hawk Country Club - Tee Time Booking Bot")
     log("=" * 60)
     log(f"Headless mode: {HEADLESS}")
+
+    config = load_booking_config()
+    if config and 'target_dates' in config:
+        log(f"Scheduled dates: {', '.join(sorted(config['target_dates']))}")
+    else:
+        log("No config file found — will book for any day.")
 
     success = book_tee_time()
 
