@@ -62,6 +62,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         f'<button type="submit" class="remove-btn">Remove</button>'
                         f'</form></div></div>'
                     )
+                except ValueError:
+                    continue
         else:
             dates_html = '<p class="dim">No dates scheduled. Add one below.</p>'
 
