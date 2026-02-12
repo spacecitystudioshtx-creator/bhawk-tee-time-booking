@@ -1,0 +1,15 @@
+{
+  "recurring": [
+    {
+      "day": "friday",
+      "time_start": 7,
+      "time_end": 18
+    },
+    {
+      "day": "saturday",
+      "time_start": 9,
+      "time_end": 18
+    }
+  ],
+  "target_dates": []
+}

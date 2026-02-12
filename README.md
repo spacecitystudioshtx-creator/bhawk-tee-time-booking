@@ -2,14 +2,6 @@
 
 This project is configured to run on your Mac with `launchd` and wake via `pmset`.
 
-## Reliability Requirements (Important)
-
-This runs as a macOS `LaunchAgent` (user GUI job). That means:
-
-- The Mac must be powered on (sleep is OK, shutdown is not).
-- Your user must be logged in. If you fully sign out, LaunchAgents do not run.
-- Locking the screen is OK.
-
 ## Current Automation Setup
 
 - LaunchAgent: `/Users/alexdimitroff/Library/LaunchAgents/com.alexdimitroff.bhawk-tee-time.plist`
@@ -49,34 +41,18 @@ launchctl print gui/$(id -u)/com.alexdimitroff.bhawk-tee-time
 pmset -g sched
 ```
 
-## Python Environment (Avoid "new Python broke it")
-
-Use the project virtualenv so system Python updates do not break dependencies.
-
-Create/install:
-
-```bash
-cd /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-pip install setuptools
-```
-
 Run manually now (normal mode):
 
 ```bash
 cd /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking
-source venv/bin/activate
-HEADLESS=false python3 book_tee_time.py
+HEADLESS=false /Users/alexdimitroff/.claude-worktrees/bhawk-tee-time-booking/lucid-chatterjee/venv/bin/python book_tee_time.py
 ```
 
 Run manually for testing a different lead time (example `+6` days):
 
 ```bash
 cd /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking
-source venv/bin/activate
-HEADLESS=false DAYS_AHEAD=6 python3 book_tee_time.py
+HEADLESS=false DAYS_AHEAD=6 /Users/alexdimitroff/.claude-worktrees/bhawk-tee-time-booking/lucid-chatterjee/venv/bin/python book_tee_time.py
 ```
 
 ## Notes
