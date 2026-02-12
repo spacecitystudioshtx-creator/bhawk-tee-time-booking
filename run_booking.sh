@@ -1,6 +1,7 @@
 #!/bin/bash
 # run_booking.sh - Cron wrapper for the tee time booking bot
-# This script is called by cron every Saturday at 6:50 AM (before 7 AM booking window)
+# Called by cron daily at 6:50 AM (before 7 AM booking window)
+# Only books if today + 8 days matches a scheduled date in booking_config.json
 # It sets up the environment and runs book_tee_time.py with proper logging
 
 set -euo pipefail

@@ -16,9 +16,12 @@ def load_config():
     return {"target_dates": []}
 
 def save_config(config):
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+    except OSError:
+        print(f"Warning: Cannot write to {CONFIG_PATH} (read-only filesystem)")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
