@@ -11,6 +11,8 @@ import sys
 import time
 import json
 import logging
+import subprocess
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import undetected_chromedriver as uc
@@ -40,22 +42,25 @@ TARGET_TIME_START = 9  # 9 AM
 TARGET_TIME_END = 10.5   # 10:30 AM
 BOOKING_HOUR = 7  # Tee times open at 7 AM
 BOOKING_MINUTE = 0
-DAYS_AHEAD = 8  # Book 8 days in advance
+DAYS_AHEAD = int(os.getenv('DAYS_AHEAD', '8'))  # Book 8 days in advance by default
 
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
 
-# Config file for scheduled target dates (shared via /logs/ volume)
-CONFIG_FILE = os.path.join(LOG_DIR, 'booking_config.json')
+# Config file for scheduled target dates.
+# Prefer project root config, then fallback to logs/ for backwards compatibility.
+PRIMARY_CONFIG_FILE = os.path.join(SCRIPT_DIR, 'booking_config.json')
+FALLBACK_CONFIG_FILE = os.path.join(LOG_DIR, 'booking_config.json')
 
 def load_booking_config():
     """Load booking configuration from shared config file"""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            log(f"Warning: Could not read config file: {e}")
+    for config_path in (PRIMARY_CONFIG_FILE, FALLBACK_CONFIG_FILE):
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                log(f"Warning: Could not read config file {config_path}: {e}")
     return None
 
 def setup_logging():
@@ -97,23 +102,33 @@ def calculate_target_date():
 def should_book_today():
     """
     Check if today is a scheduled booking day.
-    Returns the target date if we should book, or None to skip.
+    Returns (target_date, time_start, time_end) if we should book, or None to skip.
+    Checks both one-off target_dates and recurring day-of-week entries.
     """
     target = calculate_target_date()
     target_str = target.strftime('%Y-%m-%d')
+    target_day = target.strftime('%A').lower()
     config = load_booking_config()
 
-    if config and 'target_dates' in config:
-        if target_str in config['target_dates']:
-            log(f"Scheduled booking found: {target_str} ({target.strftime('%A')})")
-            return target
-        else:
-            log(f"No booking scheduled for {target_str} ({target.strftime('%A')}). Skipping.")
-            return None
-    else:
-        # No config file — fall back to always booking (legacy behavior)
-        log(f"No config file found. Booking for {target_str} ({target.strftime('%A')}).")
-        return target
+    if not config:
+        log(f"No config file found. Booking for {target_str} ({target.strftime('%A')}) with default time window.")
+        return target, TARGET_TIME_START, TARGET_TIME_END
+
+    # Recurring day rules (ex: friday, saturday)
+    for entry in config.get('recurring', []):
+        if entry.get('day', '').lower() == target_day:
+            t_start = entry.get('time_start', TARGET_TIME_START)
+            t_end = entry.get('time_end', TARGET_TIME_END)
+            log(f"Recurring {target_day} booking: {target_str} (time window {t_start}-{t_end})")
+            return target, t_start, t_end
+
+    # One-off dates
+    if target_str in config.get('target_dates', []):
+        log(f"Scheduled booking found: {target_str} ({target.strftime('%A')})")
+        return target, TARGET_TIME_START, TARGET_TIME_END
+
+    log(f"No booking scheduled for {target_str} ({target.strftime('%A')}). Skipping.")
+    return None
 
 def wait_until_booking_time():
     """
@@ -163,16 +178,49 @@ def wait_for_element(driver, by, value, timeout=30):
         EC.presence_of_element_located((by, value))
     )
 
+def detect_chrome_version():
+    """Detect installed Chrome major version to avoid ChromeDriver mismatch."""
+    chrome_paths = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        'google-chrome',
+        'chromium-browser',
+        'chromium',
+    ]
+    for path in chrome_paths:
+        try:
+            output = subprocess.check_output([path, '--version'], stderr=subprocess.DEVNULL, timeout=5)
+            match = re.search(r'(\d+)\.', output.decode())
+            if match:
+                version = int(match.group(1))
+                log(f"Detected Chrome version: {version}")
+                return version
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            continue
+    log("Could not detect Chrome version, letting undetected-chromedriver guess")
+    return None
+
+def click_any(driver, selectors, timeout=20):
+    """Try multiple selectors and click the first available button."""
+    for by, value in selectors:
+        try:
+            wait_and_click(driver, by, value, timeout=timeout)
+            return True
+        except TimeoutException:
+            continue
+    return False
+
 def book_tee_time():
     """Main function to book tee time"""
     log("Starting tee time booking automation...")
 
-    target_date = should_book_today()
-    if target_date is None:
+    result = should_book_today()
+    if result is None:
         log("Nothing to book today. Exiting.")
         return True  # Not an error, just no booking scheduled
 
+    target_date, time_start, time_end = result
     log(f"Target date: {target_date.strftime('%A, %B %d, %Y')}")
+    log(f"Time window: {time_start}:00 - {time_end}:00")
 
     # Configure undetected Chrome
     log("Launching browser with undetected-chromedriver...")
@@ -199,7 +247,11 @@ def book_tee_time():
     user_data_dir = os.path.expanduser('~/.uc-bhcc-profile')
     options.add_argument(f'--user-data-dir={user_data_dir}')
 
-    driver = uc.Chrome(options=options, use_subprocess=True)
+    chrome_version = detect_chrome_version()
+    chrome_kwargs = dict(options=options, use_subprocess=True)
+    if chrome_version:
+        chrome_kwargs['version_main'] = chrome_version
+    driver = uc.Chrome(**chrome_kwargs)
 
     try:
         # Step 1: Navigate to login page
@@ -320,23 +372,28 @@ def book_tee_time():
 
         # Wait for results
         log("Waiting for search results to load...")
-        time.sleep(5)
+        time.sleep(3)
+        log(f"Current URL after search: {driver.current_url}")
+        save_screenshot(driver, 'after_search_click')
 
-        # Wait for tee times to appear
+        # Wait for tee times to appear (up to 60 seconds)
         try:
-            WebDriverWait(driver, 30).until(
+            WebDriverWait(driver, 60).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, 'span.time.ng-binding'))
             )
             log("Tee times loaded successfully!")
         except TimeoutException:
-            log("Warning: Tee time elements took longer than expected to load, continuing anyway...")
-            time.sleep(5)
+            log("Warning: Tee time elements took longer than expected to load...")
+            save_screenshot(driver, 'search_timeout')
+            time.sleep(10)
+            page_text = driver.find_element(By.TAG_NAME, 'body').text
+            log(f"Page text excerpt: {page_text[:500]}")
 
         # Screenshot the search results for debugging
         save_screenshot(driver, 'search_results')
 
-        # Step 7: Find and click View for first available time between 9-10 AM
-        log(f"Looking for tee times between {TARGET_TIME_START}:00 AM and {TARGET_TIME_END}:00 AM...")
+        # Step 7: Find and click View for first available time in desired window
+        log(f"Looking for tee times between {time_start}:00 and {time_end}:00...")
 
         time_spans = driver.find_elements(By.CSS_SELECTOR, 'span.time.ng-binding')
         view_buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'primary-btn') and contains(text(), 'View')]")
@@ -351,8 +408,8 @@ def book_tee_time():
                 time_obj = datetime.strptime(time_text, '%I:%M %p')
                 hour_decimal = time_obj.hour + time_obj.minute / 60.0
 
-                # Check if time is in target window (9:00 AM to 10:30 AM)
-                if TARGET_TIME_START <= hour_decimal < TARGET_TIME_END:
+                # Check if time is in target window
+                if time_start <= hour_decimal < time_end:
                     log(f"Found available time: {time_text}")
 
                     # Click the corresponding View button
@@ -392,12 +449,30 @@ def book_tee_time():
 
         # Step 9: Click Continue on payment page
         log("Proceeding through payment page...")
-        wait_and_click(driver, By.CSS_SELECTOR, 'button#buyTeeTime.tokenex_submit')
+        clicked_continue = click_any(driver, [
+            (By.CSS_SELECTOR, 'button#buyTeeTime.tokenex_submit'),
+            (By.CSS_SELECTOR, 'button#buyTeeTime'),
+            (By.XPATH, "//button[contains(., 'Continue') and not(@disabled)]"),
+            (By.XPATH, "//a[contains(., 'Continue')]"),
+        ], timeout=25)
+        if not clicked_continue:
+            save_screenshot(driver, 'payment_continue_not_found')
+            log("ERROR: Could not find payment continue button.")
+            return False
         time.sleep(3)
 
         # Step 10: Click Finish Reservation
         log("Finalizing reservation...")
-        wait_and_click(driver, By.CSS_SELECTOR, 'button#topFinishBtn')
+        clicked_finish = click_any(driver, [
+            (By.CSS_SELECTOR, 'button#topFinishBtn'),
+            (By.XPATH, "//button[contains(., 'Finish') and not(@disabled)]"),
+            (By.XPATH, "//button[contains(., 'Complete') and not(@disabled)]"),
+            (By.XPATH, "//button[contains(., 'Reserve') and not(@disabled)]"),
+        ], timeout=25)
+        if not clicked_finish:
+            save_screenshot(driver, 'finish_button_not_found')
+            log("ERROR: Could not find final reservation button.")
+            return False
         time.sleep(3)
 
         # Step 11: Verify success
@@ -437,12 +512,16 @@ def main():
     log("Black Hawk Country Club - Tee Time Booking Bot")
     log("=" * 60)
     log(f"Headless mode: {HEADLESS}")
+    log(f"DAYS_AHEAD: {DAYS_AHEAD}")
 
     config = load_booking_config()
-    if config and 'target_dates' in config:
+    if config and 'recurring' in config:
+        for entry in config.get('recurring', []):
+            log(f"Recurring: {entry.get('day')} (time {entry.get('time_start')}-{entry.get('time_end')})")
+    if config and 'target_dates' in config and config['target_dates']:
         log(f"Scheduled dates: {', '.join(sorted(config['target_dates']))}")
     else:
-        log("No config file found — will book for any day.")
+        log("No scheduled one-off dates configured.")
 
     success = book_tee_time()
 
