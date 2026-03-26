@@ -20,7 +20,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
 # Resolve paths relative to this script's location
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -165,12 +165,28 @@ def save_screenshot(driver, name):
     return filepath
 
 def wait_and_click(driver, by, value, timeout=30):
-    """Wait for element and click it"""
-    element = WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((by, value))
-    )
-    element.click()
-    return element
+    """Wait for element and click it, with interception fallback."""
+    last_error = None
+    for _ in range(3):
+        element = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((by, value))
+        )
+        try:
+            element.click()
+            return element
+        except ElementClickInterceptedException as e:
+            last_error = e
+            # Overlay race: JS click fallback is often enough to recover.
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+                driver.execute_script("arguments[0].click();", element)
+                return element
+            except Exception:
+                time.sleep(0.15)
+                continue
+    if last_error:
+        raise last_error
+    raise TimeoutException(f"Could not click element: {by}={value}")
 
 def wait_for_element(driver, by, value, timeout=30):
     """Wait for element to be present"""
@@ -207,7 +223,27 @@ def click_any(driver, selectors, timeout=20):
             return True
         except TimeoutException:
             continue
+        except ElementClickInterceptedException:
+            continue
     return False
+
+def accept_adjustment_if_present(driver, timeout=2):
+    """Click Yes immediately if the tee-time-adjustment modal is shown."""
+    try:
+        yes_btn = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//div[contains(@class,'modal') and contains(@class,'in')]//button[contains(., 'Yes')]"
+            ))
+        )
+        try:
+            yes_btn.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", yes_btn)
+        log("Accepted alternative tee time (clicked Yes on adjustment modal).")
+        return True
+    except TimeoutException:
+        return False
 
 def book_tee_time():
     """Main function to book tee time"""
@@ -235,13 +271,15 @@ def book_tee_time():
     }
     options.add_experimental_option("prefs", prefs)
 
-    # Headless mode for server
+    # Headless mode — works when laptop is locked or lid is closed
     if HEADLESS:
         options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
-        log("Running in headless mode...")
+        options.add_argument('--window-position=0,0')
+        options.add_argument('--disable-software-rasterizer')
+        log("Running in headless mode (no display required)...")
 
     # Use a persistent profile to maintain cookies
     user_data_dir = os.path.expanduser('~/.uc-bhcc-profile')
@@ -428,23 +466,30 @@ def book_tee_time():
             return False
 
         # Step 8: Handle popup - click Continue
+        # If the first slot was taken, accept replacement immediately.
+        accept_adjustment_if_present(driver, timeout=1)
         log("Confirming reservation details in popup...")
         time.sleep(2)
-        wait_and_click(driver, By.CSS_SELECTOR, 'button#addToCartBtn')
+        clicked_add_to_cart = click_any(driver, [
+            (By.CSS_SELECTOR, 'button#addToCartBtn'),
+            (By.XPATH, "//button[contains(., 'Continue') and not(@disabled)]"),
+        ], timeout=10)
+        if not clicked_add_to_cart:
+            # One more fast adjustment check, then retry once.
+            if accept_adjustment_if_present(driver, timeout=2):
+                clicked_add_to_cart = click_any(driver, [
+                    (By.CSS_SELECTOR, 'button#addToCartBtn'),
+                    (By.XPATH, "//button[contains(., 'Continue') and not(@disabled)]"),
+                ], timeout=8)
+        if not clicked_add_to_cart:
+            save_screenshot(driver, 'cart_continue_not_found')
+            log("ERROR: Could not find cart continue button.")
+            return False
         time.sleep(3)
 
         # Step 8b: Handle "Tee Time Adjustment" popup if it appears
         # This happens when someone else grabbed the time before us
-        try:
-            adjustment_popup = driver.find_element(By.XPATH, "//div[contains(text(), 'Tee Time Adjustment')]")
-            if adjustment_popup:
-                log("Tee Time Adjustment popup detected - original time was taken!")
-                # Click "Yes" to accept the alternative time
-                yes_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Yes')]")
-                yes_button.click()
-                log("Accepted alternative tee time")
-                time.sleep(3)
-        except NoSuchElementException:
+        if not accept_adjustment_if_present(driver, timeout=1):
             log("No adjustment needed, proceeding...")
 
         # Step 9: Click Continue on payment page

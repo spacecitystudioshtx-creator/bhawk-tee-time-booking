@@ -1,61 +1,65 @@
 # Black Hawk Tee Time Booking (Mac Local)
 
-This project is configured to run on your Mac with `launchd` and wake via `pmset`.
+Automated tee time booking for Black Hawk Country Club. Runs headless via `launchd` — works even when the laptop is locked or the lid is closed.
 
-## Current Automation Setup
+## How It Works
 
-- LaunchAgent: `/Users/alexdimitroff/Library/LaunchAgents/com.alexdimitroff.bhawk-tee-time.plist`
-- Script path: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/run_local.sh`
-- Schedule:
-  - Thursday at `06:50`
-  - Friday at `06:50`
-- Booking logic:
-  - Bot always books `+8 days` from run date.
-  - Thursday run targets Friday tee times.
-  - Friday run targets Saturday tee times.
-  - Search clicks at/after `7:00 AM`, then filters by configured time windows.
+- LaunchAgent fires at **6:50 AM** on Thursdays and Fridays
+- Bot logs in, navigates to the booking page, fills in the target date (+8 days ahead)
+- Waits until exactly **7:00 AM** (when tee times open), then clicks Search
+- Selects the first available time in the configured window and completes the reservation
 
-## Time Windows
+## Schedule
 
-Configured in `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/booking_config.json`:
+| Run Day   | Targets       | Time Window  |
+|-----------|---------------|--------------|
+| Thursday  | Next Friday   | 12:00 - 1:00 PM |
+| Friday    | Next Saturday | 12:00 - 1:00 PM |
 
-- Friday target date window: `7:00` to `18:00`
-- Saturday target date window: `9:00` to `18:00`
-
-`target_dates` is for one-off manual dates.
+Time windows are configured in `booking_config.json`.
 
 ## Key Files
 
-- Main bot: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/book_tee_time.py`
-- Local wrapper: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/run_local.sh`
-- Config: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/booking_config.json`
-- Logs: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/logs`
-- Screenshots: `/Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/screenshots`
+| File | Purpose |
+|------|---------|
+| `book_tee_time.py` | Main booking automation |
+| `run_local.sh` | Shell wrapper (activates venv, runs headless) |
+| `booking_config.json` | Recurring day/time window config |
+| `.env` | Credentials (not committed) |
+| `logs/` | Daily log files |
+| `screenshots/` | Debug screenshots from each run |
 
-## Useful Commands
+## LaunchAgent
 
-Check scheduler details:
+- Plist: `~/Library/LaunchAgents/com.alexdimitroff.bhawk-tee-time.plist`
+- Runs headless — no display or unlocked screen required
+
+### Useful Commands
 
 ```bash
-launchctl print gui/$(id -u)/com.alexdimitroff.bhawk-tee-time
+# Check if loaded
+launchctl list | grep bhawk
+
+# Reload after plist changes
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.alexdimitroff.bhawk-tee-time.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.alexdimitroff.bhawk-tee-time.plist
+
+# Check wake schedule
 pmset -g sched
 ```
 
-Run manually now (normal mode):
+## Manual Run
 
 ```bash
 cd /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking
-HEADLESS=false /Users/alexdimitroff/.claude-worktrees/bhawk-tee-time-booking/lucid-chatterjee/venv/bin/python book_tee_time.py
-```
-
-Run manually for testing a different lead time (example `+6` days):
-
-```bash
-cd /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking
-HEADLESS=false DAYS_AHEAD=6 /Users/alexdimitroff/.claude-worktrees/bhawk-tee-time-booking/lucid-chatterjee/venv/bin/python book_tee_time.py
+source venv/bin/activate
+python book_tee_time.py                    # headless by default
+HEADLESS=false python book_tee_time.py     # visible browser for debugging
+DAYS_AHEAD=2 python book_tee_time.py       # override lead time
 ```
 
 ## Notes
 
-- Today (Thu Feb 12, 2026), a live manual run successfully completed a reservation for Wed Feb 18, 2026.
-- If booking fails, check latest logs/screenshots first; checkout flow can vary and selectors may need minor updates.
+- Uses `undetected-chromedriver` to bypass bot detection on the ezlinks booking system
+- Auto-accepts "tee time adjustment" modal if the first slot gets taken
+- Logs and screenshots auto-clean after 30 days

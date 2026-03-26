@@ -21,8 +21,8 @@ if [ -f "$SCRIPT_DIR/venv/bin/activate" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-# Non-headless for ezlink/cloudflare compatibility
-HEADLESS=false python3 "$SCRIPT_DIR/book_tee_time.py" >> "$LOCAL_LOG" 2>&1
+# Headless mode — runs reliably even when laptop is locked/lid closed
+HEADLESS=true python3 "$SCRIPT_DIR/book_tee_time.py" >> "$LOCAL_LOG" 2>&1
 EXIT_CODE=$?
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] === Local booking run finished (exit code: $EXIT_CODE) ===" >> "$LOCAL_LOG"
