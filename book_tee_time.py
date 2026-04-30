@@ -337,11 +337,11 @@ def book_tee_time():
         time.sleep(2)
         log("Successfully opened booking page...")
 
-        # Step 5: Set date directly through Angular's $scope.
+        # Step 5: Set the date through Angular's $scope.
         # The form is the new ezlinks Angular SPA where ec.startDate is a STRING
-        # in MM/DD/YYYY format. Typing into the input is unreliable because of
-        # ng-model-options="{updateOn: 'blur'}". We bypass that by writing the
-        # string straight into the model and calling onDateChanged.
+        # in MM/DD/YYYY format. Typing into the input + Enter triggers an
+        # immediate search before we want it (the form's submit handler runs
+        # on Enter), so we bypass typing entirely and assign the model.
         target_date_str = target_date.strftime('%m/%d/%Y')
         log(f"Setting ec.startDate = {target_date_str} via $scope")
         result = driver.execute_script(
@@ -370,37 +370,23 @@ def book_tee_time():
         time.sleep(1.5)
         save_screenshot(driver, 'after_date_set')
 
-        # Step 6: Wait until 7:00 AM, then trigger search.
-        # We trigger search by clicking the "Search All" button. If the page
-        # has already auto-searched (e.g. on date change), we still click it
-        # to force a re-search at the precise moment the booking window opens.
-        log("Locating Search All button (any state)...")
+        # Step 6: Wait until 7:00 AM, then click Search All exactly once.
+        log("Locating Search All button...")
         search_button = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//button[contains(normalize-space(.), 'Search All')]"))
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//button[contains(normalize-space(.), 'Search All')]",
+            ))
         )
-        log("Search button present, waiting for 7:00 AM...")
+        log("Search button ready, waiting for 7:00 AM...")
 
         wait_until_booking_time()
 
-        # Click via JS to avoid disabled-state issues, then also call onSearchButtonClick
-        # directly on the scope so we don't rely on the button's enabled state.
         try:
             search_button.click()
-        except Exception:
+        except ElementClickInterceptedException:
             driver.execute_script("arguments[0].click();", search_button)
-        try:
-            driver.execute_script(
-                """
-                var input = document.getElementById('dateInput');
-                var scope = angular.element(input).scope();
-                if (scope && scope.ec && typeof scope.ec.onSearchButtonClick === 'function') {
-                    scope.$apply(function() { scope.ec.onSearchButtonClick(scope.preSearchForm); });
-                }
-                """
-            )
-        except Exception as e:
-            log(f"JS search trigger fallback failed: {e}")
-        log("Triggered search at " + datetime.now().strftime('%H:%M:%S.%f'))
+        log("Clicked search at " + datetime.now().strftime('%H:%M:%S.%f'))
 
         # Wait for results
         log("Waiting for search results to load...")
