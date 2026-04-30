@@ -35,8 +35,10 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 load_dotenv(os.path.join(SCRIPT_DIR, '.env'))
 
 # Configuration
-USERNAME = os.getenv('BHCC_USERNAME', 'alexander.dimitroff')
-PASSWORD = os.getenv('BHCC_PASSWORD', 'Xovxeq-zusci8')
+USERNAME = os.getenv('BHCC_USERNAME')
+PASSWORD = os.getenv('BHCC_PASSWORD')
+if not USERNAME or not PASSWORD:
+    raise SystemExit("BHCC_USERNAME and BHCC_PASSWORD must be set in .env")
 NUM_PLAYERS = 4
 TARGET_TIME_START = 9  # 9 AM
 TARGET_TIME_END = 10.5   # 10:30 AM
@@ -313,44 +315,15 @@ def book_tee_time():
         time.sleep(4)
         save_screenshot(driver, 'after_login')
 
-        # Step 3: Open menu
-        log("Opening navigation menu...")
-        wait_and_click(driver, By.CSS_SELECTOR, 'div.nav-trigger')
-        time.sleep(2)
-
-        # Step 4: Click "Book A Tee Time" link
-        log("Clicking Book A Tee Time link...")
-
-        # Store original window handle
-        original_window = driver.current_window_handle
-
-        # Wait for menu to fully open and find the link
-        time.sleep(2)
-
-        # Try multiple selectors for the booking link
-        try:
-            wait_and_click(driver, By.CSS_SELECTOR, 'a[href="/club/scripts/interfaces/ezlinks.asp"]', timeout=10)
-        except TimeoutException:
-            log("First selector failed, trying XPath with text...")
-            try:
-                wait_and_click(driver, By.XPATH, "//a[contains(text(), 'Book A Tee Time')]", timeout=10)
-            except TimeoutException:
-                log("XPath failed, trying partial link text...")
-                wait_and_click(driver, By.PARTIAL_LINK_TEXT, "Book A Tee Time", timeout=10)
-
-        time.sleep(3)
-
-        # Switch to new tab if opened
-        if len(driver.window_handles) > 1:
-            for handle in driver.window_handles:
-                if handle != original_window:
-                    driver.switch_to.window(handle)
-                    log("Switched to booking page tab...")
-                    break
-
-        # Wait for booking page to load
-        log("Waiting for booking page to fully initialize...")
+        # Step 3: Navigate directly to ezlinks SSO endpoint in the same tab.
+        # The site's "Book A Tee Time" link uses target="_blank" + a JS popup
+        # which is fragile to drive. Direct GET on ezlinks.asp triggers the
+        # SSO redirect to houstonmemberbh.ezlinksgolf.com#/preSearch with the
+        # logged-in session, and avoids tab-handle bookkeeping entirely.
+        log("Navigating directly to ezlinks booking page (SSO redirect)...")
+        driver.get('https://www.bhawkcc.com/club/scripts/interfaces/ezlinks.asp')
         time.sleep(5)
+        log(f"Booking page URL: {driver.current_url}")
 
         # Wait for date input to be enabled
         try:
@@ -364,49 +337,70 @@ def book_tee_time():
         time.sleep(2)
         log("Successfully opened booking page...")
 
-        # Step 5: Fill in date
-        log(f"Selecting date: {target_date.strftime('%m/%d/%Y')}")
-        date_input = wait_for_element(driver, By.CSS_SELECTOR, 'input#dateInput')
-        date_input.click()
-        time.sleep(1)
-
-        # Clear and type the date
-        date_input.clear()
-        date_input.send_keys(target_date.strftime('%m/%d/%Y'))
-        time.sleep(1)
-
-        # Press Enter to confirm
-        log("Pressing Enter to load calendar...")
-        date_input.send_keys(Keys.ENTER)
-        time.sleep(2)
-
-        # Click the day in the calendar
-        day_number = str(target_date.day)
-        log(f"Clicking day {day_number} in calendar popup...")
-
-        # Find and click the day link
-        day_links = driver.find_elements(By.CSS_SELECTOR, 'a.ui-state-default')
-        for link in day_links:
-            if link.text.strip() == day_number:
-                link.click()
-                break
-        time.sleep(2)
-
-        # Step 6: WAIT UNTIL 7:00 AM THEN CLICK SEARCH
-        log("Form is ready. Preparing to search...")
-
-        # Find the search button first (before waiting)
-        search_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Search')]"))
+        # Step 5: Set date directly through Angular's $scope.
+        # The form is the new ezlinks Angular SPA where ec.startDate is a STRING
+        # in MM/DD/YYYY format. Typing into the input is unreliable because of
+        # ng-model-options="{updateOn: 'blur'}". We bypass that by writing the
+        # string straight into the model and calling onDateChanged.
+        target_date_str = target_date.strftime('%m/%d/%Y')
+        log(f"Setting ec.startDate = {target_date_str} via $scope")
+        result = driver.execute_script(
+            """
+            var dateStr = arguments[0];
+            var input = document.getElementById('dateInput');
+            if (!input) return {err: 'no-input'};
+            if (!window.angular) return {err: 'no-angular'};
+            var scope = angular.element(input).scope();
+            if (!scope || !scope.ec) return {err: 'no-scope-ec'};
+            scope.$apply(function() {
+                scope.ec.startDate = dateStr;
+                if (typeof scope.ec.onDateChanged === 'function') {
+                    scope.ec.onDateChanged(scope.ec.startDate);
+                }
+            });
+            return {
+                ok: true,
+                startDate: String(scope.ec.startDate || ''),
+                enableSearchButton: !!scope.ec.enableSearchButton
+            };
+            """,
+            target_date_str,
         )
-        log("Search button located, waiting for 7:00 AM...")
+        log(f"Scope set result: {result}")
+        time.sleep(1.5)
+        save_screenshot(driver, 'after_date_set')
 
-        # Wait until exactly 7:00 AM
+        # Step 6: Wait until 7:00 AM, then trigger search.
+        # We trigger search by clicking the "Search All" button. If the page
+        # has already auto-searched (e.g. on date change), we still click it
+        # to force a re-search at the precise moment the booking window opens.
+        log("Locating Search All button (any state)...")
+        search_button = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//button[contains(normalize-space(.), 'Search All')]"))
+        )
+        log("Search button present, waiting for 7:00 AM...")
+
         wait_until_booking_time()
 
-        # CLICK IMMEDIATELY at 7:00 AM
-        search_button.click()
-        log("Clicked search button at " + datetime.now().strftime('%H:%M:%S.%f'))
+        # Click via JS to avoid disabled-state issues, then also call onSearchButtonClick
+        # directly on the scope so we don't rely on the button's enabled state.
+        try:
+            search_button.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", search_button)
+        try:
+            driver.execute_script(
+                """
+                var input = document.getElementById('dateInput');
+                var scope = angular.element(input).scope();
+                if (scope && scope.ec && typeof scope.ec.onSearchButtonClick === 'function') {
+                    scope.$apply(function() { scope.ec.onSearchButtonClick(scope.preSearchForm); });
+                }
+                """
+            )
+        except Exception as e:
+            log(f"JS search trigger fallback failed: {e}")
+        log("Triggered search at " + datetime.now().strftime('%H:%M:%S.%f'))
 
         # Wait for results
         log("Waiting for search results to load...")
