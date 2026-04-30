@@ -9,12 +9,6 @@
       "day": "sunday",
       "time_start": 14,
       "time_end": 17
-    },
-    {
-      "day": "wednesday",
-      "time_start": 6,
-      "time_end": 20,
-      "_comment": "TEMPORARY: dry-run only. Remove after 2026-05-06 booking succeeds."
     }
   ],
   "target_dates": []

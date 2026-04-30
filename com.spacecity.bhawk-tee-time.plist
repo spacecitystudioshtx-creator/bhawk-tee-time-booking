@@ -47,7 +47,7 @@
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HEADLESS</key>
-        <string>true</string>
+        <string>false</string>
     </dict>
 </dict>
 </plist>

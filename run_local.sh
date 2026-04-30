@@ -21,8 +21,12 @@ if [ -f "$SCRIPT_DIR/venv/bin/activate" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-# Headless mode — runs reliably even when laptop is locked/lid closed
-HEADLESS=true python3 "$SCRIPT_DIR/book_tee_time.py" >> "$LOCAL_LOG" 2>&1
+# Visible browser — ezlinks blocks headless undetected-chromedriver with a
+# perpetual "Please Wait..." spinner. Verified 2026-04-30: visible mode
+# completes a real reservation; headless gets stuck at the search results
+# page. The Mac must be awake and the user logged in for Chrome to get a
+# rendering context. HEADLESS env can be overridden by the caller.
+HEADLESS="${HEADLESS:-false}" python3 "$SCRIPT_DIR/book_tee_time.py" >> "$LOCAL_LOG" 2>&1
 EXIT_CODE=$?
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] === Local booking run finished (exit code: $EXIT_CODE) ===" >> "$LOCAL_LOG"
