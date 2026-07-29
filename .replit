@@ -1,0 +1,20 @@
+run = "python3 server.py"
+modules = ["python-3.12"]
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+HEADLESS = "true"
+BOOKING_TZ = "America/Chicago"
+
+# The dashboard listens on $PORT (default 8080).
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+# Deploy as Reserved VM (Web Server) so the process + browser run 24/7
+# and the dashboard is reachable. Autoscale sleeps between requests — no good.
+[deployment]
+run = ["python3", "server.py"]
+deploymentTarget = "vm"

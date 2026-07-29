@@ -1,14 +1,15 @@
 {
+  "provider": "blackhawk",
   "recurring": [
     {
       "day": "friday",
-      "time_start": 12,
-      "time_end": 13
+      "time_start": 9.5,
+      "time_end": 10.5
     },
     {
       "day": "saturday",
-      "time_start": 12,
-      "time_end": 13
+      "time_start": 9.5,
+      "time_end": 10.5
     }
   ],
   "target_dates": []

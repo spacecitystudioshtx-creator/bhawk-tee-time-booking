@@ -8,7 +8,17 @@
       "Bash(sshpass -p '::m7Pp@G2fV%=b' ssh -o StrictHostKeyChecking=no root@159.89.41.54 \"echo ''Connected!'' && uname -a\")",
       "Bash(brew install:*)",
       "Bash(sshpass -p '::m7Pp@G2fV%=b' ssh -o StrictHostKeyChecking=no root@159.89.41.54 \"mkdir -p ~/.ssh && echo ''ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJBLdUkeXyk4HNG13Nt3ETsfPQi0NsdP1mvCIzbC99fR alexdimitroff@tee-time-booking'' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo ''SSH key added successfully!''\")",
-      "Bash(scp:*)"
+      "Bash(scp:*)",
+      "WebFetch(domain:chatgpt.com)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg)",
+      "Bash(cp main.py .replit replit.nix requirements.txt booking_config.json README.md /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg/)",
+      "Bash(zip -q -r /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/bhawk-replit-package.zip .)",
+      "Bash(unzip -l /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/bhawk-replit-package.zip)",
+      "Bash(rm -rf /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg/providers)",
+      "Bash(cp server.py web.py worker.py browser.py notify.py status.py booking_config.json requirements.txt .replit replit.nix README.md /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg/)",
+      "Bash(cp providers/*.py /private/tmp/claude-501/-Users-alexdimitroff-Space-City-Studios-bhawk-tee-time-booking/bbdf800c-9844-4424-a24e-9129f448d03c/scratchpad/replit-pkg/providers/)",
+      "Bash(zip -q -r /Users/alexdimitroff/Space-City-Studios/bhawk-tee-time-booking/golfbot-replit-package.zip .)"
     ]
   }
 }

@@ -28,3 +28,7 @@ __pycache__/
 
 # Logs
 *.log
+logs/booked_dates.json
+
+# Playwright persistent browser profile
+.pw-bhcc-profile/

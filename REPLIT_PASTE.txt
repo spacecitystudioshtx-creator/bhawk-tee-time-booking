@@ -1,0 +1,1342 @@
+Create this Python project EXACTLY as specified below. Do not re-architect, rename files, or add features — just create each file with the exact contents given, verbatim.
+
+After creating the files:
+1. Run: pip install -r requirements.txt
+2. Tell me to add these Secrets: BHCC_USERNAME, BHCC_PASSWORD, DASHBOARD_PASSWORD (required); TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, SMS_TO, DASHBOARD_URL, DRY_RUN (optional).
+3. Do NOT run the app until I've added the secrets.
+4. The app is started with: python3 server.py (already configured in .replit). It will later be deployed as a Reserved VM Web Server.
+
+Each file below starts with a line "===== FILE: <path> =====" and runs until the next such line. File contents are verbatim — preserve indentation and blank lines exactly.
+
+===== FILE: .replit =====
+run = "python3 server.py"
+modules = ["python-3.12"]
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+HEADLESS = "true"
+BOOKING_TZ = "America/Chicago"
+
+# The dashboard listens on $PORT (default 8080).
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+# Deploy as Reserved VM (Web Server) so the process + browser run 24/7
+# and the dashboard is reachable. Autoscale sleeps between requests — no good.
+[deployment]
+run = ["python3", "server.py"]
+deploymentTarget = "vm"
+
+===== FILE: replit.nix =====
+{ pkgs }: {
+  deps = [
+    # System Chromium — main.py auto-detects it via `which chromium`,
+    # avoiding Playwright's bundled-browser download (which fails on Replit
+    # due to missing system libraries).
+    pkgs.chromium
+  ];
+}
+
+===== FILE: requirements.txt =====
+playwright>=1.61.0
+python-dotenv>=1.0.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+requests>=2.32.0
+
+===== FILE: booking_config.json =====
+{
+  "provider": "blackhawk",
+  "recurring": [
+    {
+      "day": "friday",
+      "time_start": 9.5,
+      "time_end": 10.5
+    },
+    {
+      "day": "saturday",
+      "time_start": 9.5,
+      "time_end": 10.5
+    }
+  ],
+  "target_dates": []
+}
+
+===== FILE: server.py =====
+#!/usr/bin/env python3
+"""
+Golf tee time booking service — entrypoint.
+
+Threads:
+  - browser-executor: owns the one persistent Playwright Chromium
+  - worker:           scheduler (snipes, cancellation polling, health checks)
+  - main:             FastAPI dashboard (uvicorn)
+
+Required secrets: BHCC_USERNAME, BHCC_PASSWORD, DASHBOARD_PASSWORD
+Optional: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, SMS_TO,
+          DASHBOARD_URL, DRY_RUN, HEADLESS, DAYS_AHEAD, BOOKING_TZ
+"""
+
+import os
+import sys
+import logging
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+load_dotenv()  # local .env; on Replit, Secrets are already in the environment
+
+from status import Status, LOG_DIR, TZ  # noqa: E402
+
+
+def setup_logging():
+    logger = logging.getLogger('bhawk')
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fmt = logging.Formatter('[%(asctime)s] %(message)s',
+                                datefmt='%Y-%m-%d %H:%M:%S')
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+        fh = logging.FileHandler(
+            os.path.join(LOG_DIR, f'booking_{datetime.now(TZ):%Y-%m-%d}.log'))
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+def main():
+    log = setup_logging().info
+    if not os.getenv('BHCC_USERNAME') or not os.getenv('BHCC_PASSWORD'):
+        log("FATAL: set BHCC_USERNAME and BHCC_PASSWORD secrets.")
+        sys.exit(1)
+    if not os.getenv('DASHBOARD_PASSWORD'):
+        log("WARNING: DASHBOARD_PASSWORD not set — the dashboard will refuse "
+            "all requests until you add it.")
+
+    from browser import BrowserExecutor
+    from worker import Worker
+    from web import create_app
+    import uvicorn
+
+    status = Status()
+    executor = BrowserExecutor()
+    executor.start()
+    Worker(executor, status).start()
+
+    port = int(os.getenv('PORT', '8080'))
+    log(f"Dashboard on port {port}")
+    uvicorn.run(create_app(executor, status), host='0.0.0.0', port=port,
+                log_level='warning')
+
+
+if __name__ == '__main__':
+    main()
+
+===== FILE: status.py =====
+"""Thread-safe application state + event log + booked-date persistence."""
+
+import os
+import json
+import threading
+from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo(os.getenv('BOOKING_TZ', 'America/Chicago'))
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, 'logs')
+SCREENSHOT_DIR = os.path.join(SCRIPT_DIR, 'screenshots')
+BOOKED_FILE = os.path.join(LOG_DIR, 'booked_dates.json')
+CONFIG_FILE = os.path.join(SCRIPT_DIR, 'booking_config.json')
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+def now_local():
+    return datetime.now(TZ)
+
+
+class Status:
+    """Single shared object: live state for the dashboard + rolling event log."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.events = deque(maxlen=300)
+        self.data = {
+            'started_at': now_local().isoformat(),
+            'browser_ok': False,
+            'login_ok': None,          # None = unknown yet
+            'last_health_check': None,
+            'next_action': None,       # human-readable description
+            'last_result': None,
+            'paused': False,
+            'pause_reason': None,
+        }
+
+    def set(self, **kw):
+        with self._lock:
+            self.data.update(kw)
+
+    def get(self, key):
+        with self._lock:
+            return self.data.get(key)
+
+    def event(self, msg):
+        with self._lock:
+            self.events.appendleft(f"[{now_local():%Y-%m-%d %H:%M:%S}] {msg}")
+
+    def pause(self, reason):
+        self.set(paused=True, pause_reason=reason)
+        self.event(f"PAUSED: {reason}")
+
+    def resume(self):
+        self.set(paused=False, pause_reason=None)
+        self.event("Resumed by user.")
+
+    def snapshot(self):
+        with self._lock:
+            return {**self.data, 'events': list(self.events)}
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'recurring': [], 'target_dates': []}
+
+
+def load_booked():
+    try:
+        with open(BOOKED_FILE) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def mark_booked(date_str):
+    booked = load_booked()
+    booked.add(date_str)
+    with open(BOOKED_FILE, 'w') as f:
+        json.dump(sorted(booked), f)
+
+===== FILE: notify.py =====
+"""SMS notifications via the Twilio REST API.
+
+Runs in log-only mode until all four env vars are set (Replit Secrets):
+  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, SMS_TO
+Optional: DASHBOARD_URL — appended to alerts that need intervention.
+"""
+
+import os
+import logging
+import requests
+
+log = logging.getLogger('bhawk').info
+
+SID = os.getenv('TWILIO_ACCOUNT_SID')
+TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+FROM = os.getenv('TWILIO_FROM')
+TO = os.getenv('SMS_TO')
+DASHBOARD_URL = os.getenv('DASHBOARD_URL', '')
+
+_last_sent = {}  # dedupe key -> last message, so we don't spam repeats
+
+
+def sms(message, dedupe_key=None, with_link=False):
+    """Send an SMS. dedupe_key suppresses repeats of the same message."""
+    if with_link and DASHBOARD_URL:
+        message = f"{message}\n{DASHBOARD_URL}"
+    if dedupe_key is not None:
+        if _last_sent.get(dedupe_key) == message:
+            return
+        _last_sent[dedupe_key] = message
+
+    if not all((SID, TOKEN, FROM, TO)):
+        log(f"SMS (not configured, log only): {message}")
+        return
+    try:
+        resp = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{SID}/Messages.json",
+            auth=(SID, TOKEN),
+            data={'From': FROM, 'To': TO, 'Body': message},
+            timeout=15,
+        )
+        if resp.status_code >= 300:
+            log(f"SMS failed ({resp.status_code}): {resp.text[:200]}")
+        else:
+            log(f"SMS sent: {message.splitlines()[0]}")
+    except requests.RequestException as e:
+        log(f"SMS error: {e}")
+
+===== FILE: browser.py =====
+"""Persistent browser management.
+
+Playwright's sync API is bound to the thread that created it, so ALL browser
+work runs on one dedicated BrowserExecutor thread. Other threads (scheduler,
+web dashboard) call executor.submit(fn) and get the result back.
+
+The browser itself is long-lived: one Chromium with a persistent profile so
+login cookies survive between attempts and restarts.
+"""
+
+import os
+import queue
+import shutil
+import logging
+import threading
+from datetime import datetime
+
+from playwright.sync_api import sync_playwright
+
+from status import SCREENSHOT_DIR, TZ, now_local
+
+log = logging.getLogger('bhawk').info
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROFILE_DIR = os.path.join(SCRIPT_DIR, '.pw-bhcc-profile')
+HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
+VIEWPORT = {'width': 1280, 'height': 800}
+
+
+class BrowserManager:
+    """Owns the persistent Chromium context. Only touch from the executor thread."""
+
+    def __init__(self):
+        self.pw = None
+        self.context = None
+
+    def start(self):
+        if self.context:
+            return
+        log("Launching persistent Chromium...")
+        self.pw = sync_playwright().start()
+        exe = (os.getenv('CHROMIUM_PATH') or shutil.which('chromium')
+               or shutil.which('chromium-browser'))
+        kwargs = dict(
+            user_data_dir=PROFILE_DIR,
+            headless=HEADLESS,
+            viewport=VIEWPORT,
+            locale='en-US',
+            timezone_id=str(TZ),
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ],
+        )
+        if exe:
+            log(f"Using system browser: {exe}")
+            kwargs['executable_path'] = exe
+        self.context = self.pw.chromium.launch_persistent_context(**kwargs)
+        # Headless builds advertise "HeadlessChrome" in the UA — a bot-detection
+        # giveaway. Detect and relaunch once with a cleaned UA.
+        if HEADLESS:
+            probe = self.context.pages[0] if self.context.pages else self.context.new_page()
+            ua = probe.evaluate('navigator.userAgent')
+            if 'HeadlessChrome' in ua:
+                self.context.close()
+                kwargs['user_agent'] = ua.replace('HeadlessChrome', 'Chrome')
+                log("Masked headless UA.")
+                self.context = self.pw.chromium.launch_persistent_context(**kwargs)
+        self.context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        self.context.set_default_timeout(30_000)
+
+    def stop(self):
+        for obj, closer in ((self.context, 'close'), (self.pw, 'stop')):
+            try:
+                if obj:
+                    getattr(obj, closer)()
+            except Exception:
+                pass
+        self.context = None
+        self.pw = None
+
+    def restart(self):
+        log("Restarting browser...")
+        self.stop()
+        self.start()
+
+    def page(self):
+        """The single working page; closes stray tabs from previous attempts."""
+        self.start()
+        for extra in self.context.pages[1:]:
+            try:
+                extra.close()
+            except Exception:
+                pass
+        return self.context.pages[0] if self.context.pages else self.context.new_page()
+
+    def current_page(self):
+        """Most recently opened page (e.g. the booking tab) without closing anything."""
+        self.start()
+        pages = self.context.pages
+        return pages[-1] if pages else self.context.new_page()
+
+    def screenshot_file(self, page, name):
+        path = os.path.join(SCREENSHOT_DIR, f'{name}_{now_local():%Y-%m-%d_%H%M%S}.png')
+        try:
+            page.screenshot(path=path)
+            log(f"Screenshot saved: {path}")
+        except Exception as e:
+            log(f"Screenshot failed: {e}")
+        return path
+
+    def screenshot_bytes(self):
+        return self.current_page().screenshot()
+
+    def click_at(self, x, y):
+        self.current_page().mouse.click(x, y)
+
+    def type_text(self, text):
+        self.current_page().keyboard.type(text, delay=40)
+
+    def press_key(self, key):
+        self.current_page().keyboard.press(key)
+
+
+class BrowserExecutor(threading.Thread):
+    """Single thread that owns the browser; other threads submit callables."""
+
+    def __init__(self):
+        super().__init__(daemon=True, name='browser-executor')
+        self.manager = BrowserManager()
+        self.tasks = queue.Queue()
+
+    def run(self):
+        while True:
+            fn, done, holder = self.tasks.get()
+            try:
+                holder['result'] = fn(self.manager)
+            except Exception as e:
+                holder['error'] = e
+            finally:
+                done.set()
+
+    def submit(self, fn, timeout=None):
+        """Run fn(manager) on the browser thread; blocks until done."""
+        done = threading.Event()
+        holder = {}
+        self.tasks.put((fn, done, holder))
+        if not done.wait(timeout):
+            raise TimeoutError("Browser task timed out (a long job may be running).")
+        if 'error' in holder:
+            raise holder['error']
+        return holder.get('result')
+
+    def busy(self):
+        return not self.tasks.empty()
+
+===== FILE: worker.py =====
+"""Scheduler / booking worker.
+
+Runs in its own thread. Decides WHEN to act; the actual browser work is
+submitted to the BrowserExecutor thread. Three jobs:
+
+  1. SNIPE  — recurring config entries: warm up before 7:00 AM local, fire at
+     7:00:00, retry for 20 minutes.
+  2. POLL   — one-off target_dates: re-search every 3-7 minutes for cancellations.
+  3. HEALTH — every 30 idle minutes, verify the session is still logged in and
+     SMS if it isn't.
+
+If a provider raises InterventionNeeded (CAPTCHA, login wall), the worker
+pauses, texts the dashboard link, and waits for the user to hit Resume.
+"""
+
+import os
+import time
+import random
+import logging
+import threading
+from datetime import datetime, date, timedelta
+
+import notify
+from status import Status, TZ, now_local, load_config, load_booked, mark_booked
+from providers import get_provider
+from providers.base import InterventionNeeded
+
+log = logging.getLogger('bhawk').info
+
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+DAYS_AHEAD = int(os.getenv('DAYS_AHEAD', '8'))
+BOOKING_OPEN_HOUR = 7
+SNIPE_WARMUP_MIN = 6
+SNIPE_RETRY_WINDOW_MIN = 20
+POLL_MIN_SECONDS = 3 * 60
+POLL_MAX_SECONDS = 7 * 60
+HEALTH_CHECK_SECONDS = 30 * 60
+
+WEEKDAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+            'saturday', 'sunday']
+
+
+def next_snipe_event(config, booked):
+    """Next (snipe_dt, target_date, t_start, t_end, provider) from recurring config."""
+    default_provider = config.get('provider', 'blackhawk')
+    best = None
+    for entry in config.get('recurring', []):
+        day = entry.get('day', '').lower()
+        if day not in WEEKDAYS:
+            continue
+        for offset in range(0, 15):
+            target = now_local().date() + timedelta(days=offset)
+            if target.strftime('%A').lower() != day or str(target) in booked:
+                continue
+            snipe_dt = datetime.combine(
+                target - timedelta(days=DAYS_AHEAD), datetime.min.time(),
+                tzinfo=TZ).replace(hour=BOOKING_OPEN_HOUR)
+            if snipe_dt + timedelta(minutes=SNIPE_RETRY_WINDOW_MIN) < now_local():
+                continue
+            ev = (snipe_dt, target,
+                  float(entry.get('time_start', 9)),
+                  float(entry.get('time_end', 12)),
+                  entry.get('provider', default_provider))
+            if best is None or ev[0] < best[0]:
+                best = ev
+    return best
+
+
+def poll_targets(config, booked):
+    default_provider = config.get('provider', 'blackhawk')
+    out = []
+    for entry in config.get('target_dates', []):
+        try:
+            d = date.fromisoformat(entry['date'])
+        except (KeyError, ValueError):
+            continue
+        if d >= now_local().date() and str(d) not in booked:
+            out.append((d, float(entry.get('time_start', 0)),
+                        float(entry.get('time_end', 24)),
+                        entry.get('provider', default_provider)))
+    return out
+
+
+class Worker(threading.Thread):
+    def __init__(self, executor, status: Status):
+        super().__init__(daemon=True, name='worker')
+        self.executor = executor
+        self.status = status
+        self._last_health = 0.0
+
+    # ----------------------------------------------------------- attempts
+    def _attempt(self, provider_name, target, t_start, t_end):
+        """One attempt on the browser thread. Returns result string."""
+        provider = get_provider(provider_name)
+        try:
+            result = self.executor.submit(
+                lambda m: provider.attempt(m, target, t_start, t_end, dry_run=DRY_RUN),
+                timeout=15 * 60)
+            self.status.set(last_result=f"{result} ({target}, {provider_name})",
+                            browser_ok=True, login_ok=True)
+            self.status.event(f"Attempt for {target}: {result}")
+            return result
+        except InterventionNeeded as e:
+            self.status.pause(str(e))
+            notify.sms(f"⚠️ Golf bot needs help: {e}. Take control from the dashboard, "
+                       f"then hit Resume.", dedupe_key='intervention', with_link=True)
+            return 'paused'
+        except NotImplementedError as e:
+            self.status.event(f"Provider '{provider_name}' not implemented: {e}")
+            return 'error'
+        except Exception as e:
+            log(f"Attempt error: {e}")
+            self.status.event(f"Attempt error: {e}")
+            self.status.set(browser_ok=False, last_result=f"error ({target})")
+            try:
+                self.executor.submit(lambda m: m.restart(), timeout=120)
+                self.status.set(browser_ok=True)
+            except Exception as e2:
+                log(f"Browser restart failed: {e2}")
+            return 'error'
+
+    def _booked(self, target, result_note=''):
+        mark_booked(str(target))
+        notify.sms(f"✅ Tee time booked for {target:%A %b %d}! {result_note}".strip())
+        self.status.event(f"BOOKED {target}")
+
+    def _wait_while_paused(self):
+        while self.status.get('paused'):
+            time.sleep(5)
+
+    # ----------------------------------------------------------- snipe
+    def _run_snipe(self, snipe_dt, target, t_start, t_end, provider_name):
+        warmup_dt = snipe_dt - timedelta(minutes=SNIPE_WARMUP_MIN)
+        if now_local() < warmup_dt:
+            return False
+        log(f"SNIPE MODE for {target} ({t_start}-{t_end}) via {provider_name}")
+        self.status.event(f"Snipe mode: {target} at {snipe_dt:%H:%M}")
+
+        # Warm the session so the 7:00 attempt skips login
+        provider = get_provider(provider_name)
+        try:
+            self.executor.submit(lambda m: provider.ensure_logged_in(m), timeout=180)
+            self.status.set(login_ok=True, browser_ok=True)
+        except InterventionNeeded as e:
+            self.status.pause(str(e))
+            notify.sms(f"⚠️ Login problem before the {snipe_dt:%H:%M} booking window: {e}. "
+                       f"Fix it before 7:00!", dedupe_key='intervention', with_link=True)
+            self._wait_while_paused()
+        except Exception as e:
+            log(f"Warmup failed ({e}); will still try at open.")
+
+        while now_local() < snipe_dt:
+            time.sleep(min(1, max(0.05, (snipe_dt - now_local()).total_seconds())))
+
+        deadline = snipe_dt + timedelta(minutes=SNIPE_RETRY_WINDOW_MIN)
+        while now_local() < deadline:
+            self._wait_while_paused()
+            result = self._attempt(provider_name, target, t_start, t_end)
+            if result == 'success':
+                self._booked(target)
+                return True
+            wait = random.uniform(20, 45)
+            log(f"Snipe attempt: {result}. Retrying in {wait:.0f}s...")
+            time.sleep(wait)
+        notify.sms(f"❌ No tee time found for {target:%A %b %d} "
+                   f"in the {SNIPE_RETRY_WINDOW_MIN}-min window.")
+        self.status.event(f"Snipe window closed without booking {target}")
+        return False
+
+    # ----------------------------------------------------------- health
+    def _health_check(self):
+        if time.time() - self._last_health < HEALTH_CHECK_SECONDS:
+            return
+        self._last_health = time.time()
+        # Skip if a long browser job is queued/running
+        if self.executor.busy():
+            return
+        try:
+            ok = self.executor.submit(
+                lambda m: get_provider('blackhawk').check_session(m), timeout=120)
+            self.status.set(login_ok=ok, browser_ok=True,
+                            last_health_check=now_local().isoformat())
+            if ok:
+                notify._last_sent.pop('login', None)  # re-arm the alert
+            else:
+                notify.sms("⚠️ Golf bot session expired — log back in from the "
+                           "dashboard before the next booking window.",
+                           dedupe_key='login', with_link=True)
+            self.status.event(f"Health check: {'logged in' if ok else 'LOGGED OUT'}")
+        except Exception as e:
+            self.status.set(browser_ok=False)
+            self.status.event(f"Health check failed: {e}")
+
+    # ----------------------------------------------------------- main loop
+    def run(self):
+        notify.sms("Golf bot started." + (" (DRY RUN)" if DRY_RUN else ""),
+                   dedupe_key='startup')
+        while True:
+            try:
+                self._tick()
+            except Exception as e:
+                log(f"Worker loop error: {e}")
+                self.status.event(f"Worker loop error: {e}")
+                time.sleep(60)
+
+    def _tick(self):
+        self._wait_while_paused()
+        config = load_config()
+        booked = load_booked()
+        snipe = next_snipe_event(config, booked)
+        targets = poll_targets(config, booked)
+
+        secs_to_warmup = None
+        if snipe:
+            snipe_dt, target, ts, te, prov = snipe
+            self.status.set(next_action=f"Snipe {target} at {snipe_dt:%a %m/%d %H:%M} "
+                                        f"(window {ts}-{te}, {prov})")
+            if self._run_snipe(snipe_dt, target, ts, te, prov):
+                return
+            secs_to_warmup = (snipe_dt - timedelta(minutes=SNIPE_WARMUP_MIN)
+                              - now_local()).total_seconds()
+        elif not targets:
+            self.status.set(next_action="Idle — nothing scheduled")
+
+        if targets:
+            d, ts, te, prov = targets[0]
+            self.status.set(next_action=f"Polling {d} for cancellations "
+                                        f"(window {ts}-{te}, {prov})")
+            result = self._attempt(prov, d, ts, te)
+            if result == 'success':
+                self._booked(d, '(cancellation grabbed)')
+                return
+            sleep_secs = random.uniform(POLL_MIN_SECONDS, POLL_MAX_SECONDS)
+        else:
+            self._health_check()
+            sleep_secs = 5 * 60
+
+        if secs_to_warmup is not None and secs_to_warmup > 0:
+            sleep_secs = max(30, min(sleep_secs, secs_to_warmup))
+        time.sleep(sleep_secs)
+
+===== FILE: web.py =====
+"""FastAPI dashboard: status, logs, live browser view with click/type
+passthrough ("Take Control"), and worker controls.
+
+Protected by HTTP Basic auth — set DASHBOARD_PASSWORD as a Replit Secret.
+Fails closed: with no password configured, everything returns 503.
+"""
+
+import os
+import secrets as pysecrets
+
+from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi.responses import HTMLResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+from browser import VIEWPORT
+from status import Status
+
+security = HTTPBasic()
+
+
+def create_app(executor, status: Status):
+    app = FastAPI(title="Golf Bot")
+
+    def auth(credentials: HTTPBasicCredentials = Depends(security)):
+        expected = os.getenv('DASHBOARD_PASSWORD')
+        if not expected:
+            raise HTTPException(503, "Set the DASHBOARD_PASSWORD secret first.")
+        if not pysecrets.compare_digest(credentials.password, expected):
+            raise HTTPException(401, "Bad password",
+                                headers={"WWW-Authenticate": "Basic"})
+        return True
+
+    @app.get("/api/status")
+    def api_status(_=Depends(auth)):
+        return status.snapshot()
+
+    @app.get("/api/screenshot.png")
+    def api_screenshot(_=Depends(auth)):
+        try:
+            png = executor.submit(lambda m: m.screenshot_bytes(), timeout=20)
+            return Response(png, media_type="image/png",
+                            headers={"Cache-Control": "no-store"})
+        except Exception as e:
+            raise HTTPException(409, f"Browser busy or unavailable: {e}")
+
+    @app.post("/api/click")
+    def api_click(data: dict = Body(...), _=Depends(auth)):
+        x = float(data['x']) * VIEWPORT['width']
+        y = float(data['y']) * VIEWPORT['height']
+        executor.submit(lambda m: m.click_at(x, y), timeout=20)
+        status.event(f"Manual click at ({x:.0f},{y:.0f})")
+        return {"ok": True}
+
+    @app.post("/api/type")
+    def api_type(data: dict = Body(...), _=Depends(auth)):
+        text = str(data.get('text', ''))[:500]
+        executor.submit(lambda m: m.type_text(text), timeout=30)
+        status.event("Manual keyboard input")
+        return {"ok": True}
+
+    @app.post("/api/key")
+    def api_key(data: dict = Body(...), _=Depends(auth)):
+        key = str(data.get('key', 'Enter'))
+        if key not in ('Enter', 'Tab', 'Escape', 'Backspace'):
+            raise HTTPException(400, "Unsupported key")
+        executor.submit(lambda m: m.press_key(key), timeout=20)
+        return {"ok": True}
+
+    @app.post("/api/pause")
+    def api_pause(_=Depends(auth)):
+        status.pause("Paused manually from dashboard")
+        return {"ok": True}
+
+    @app.post("/api/resume")
+    def api_resume(_=Depends(auth)):
+        status.resume()
+        return {"ok": True}
+
+    @app.post("/api/restart-browser")
+    def api_restart(_=Depends(auth)):
+        executor.submit(lambda m: m.restart(), timeout=180)
+        status.event("Browser restarted from dashboard")
+        status.set(browser_ok=True)
+        return {"ok": True}
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(_=Depends(auth)):
+        return DASHBOARD_HTML
+
+    return app
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Golf Bot</title>
+<style>
+  body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+  header{padding:12px 16px;background:#1e293b;font-weight:700}
+  .wrap{padding:12px 16px;max-width:900px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+  .card{background:#1e293b;border-radius:10px;padding:10px}
+  .card b{display:block;font-size:11px;text-transform:uppercase;color:#94a3b8;margin-bottom:4px}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}
+  button{background:#334155;color:#e2e8f0;border:0;border-radius:8px;padding:10px 14px;margin:4px 4px 4px 0;font-size:14px}
+  button.primary{background:#2563eb}
+  #shot{width:100%;border-radius:10px;border:1px solid #334155;cursor:crosshair;display:none}
+  input[type=text]{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;width:60%}
+  #log{background:#020617;border-radius:10px;padding:10px;font-family:ui-monospace,monospace;font-size:11px;
+       white-space:pre-wrap;max-height:300px;overflow-y:auto;margin-top:12px}
+  h3{margin:16px 0 8px}
+</style></head><body>
+<header>⛳ Golf Bot</header>
+<div class="wrap">
+  <div class="cards">
+    <div class="card"><b>Browser</b><span id="browser">…</span></div>
+    <div class="card"><b>Login</b><span id="login">…</span></div>
+    <div class="card"><b>Worker</b><span id="paused">…</span></div>
+    <div class="card"><b>Last result</b><span id="last">…</span></div>
+  </div>
+  <div class="card" style="margin-top:8px"><b>Next action</b><span id="next">…</span></div>
+
+  <h3>Controls</h3>
+  <button onclick="post('/api/pause')">Pause</button>
+  <button class="primary" onclick="post('/api/resume')">Resume</button>
+  <button onclick="post('/api/restart-browser')">Restart Browser</button>
+  <button class="primary" onclick="toggleControl()" id="ctlbtn">Take Control</button>
+
+  <div id="control" style="display:none">
+    <h3>Live browser — tap the page to click</h3>
+    <img id="shot">
+    <div style="margin-top:8px">
+      <input type="text" id="txt" placeholder="Type text…">
+      <button onclick="sendText()">Send</button>
+      <button onclick="post('/api/key',{key:'Enter'})">Enter</button>
+    </div>
+  </div>
+
+  <h3>Event log</h3>
+  <div id="log">loading…</div>
+</div>
+<script>
+let controlling=false, shotTimer=null;
+async function post(url,body){await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body||{})}); refresh();}
+async function refresh(){
+  const r=await fetch('/api/status'); if(!r.ok) return; const s=await r.json();
+  set('browser', s.browser_ok?'<span class=ok>running</span>':'<span class=bad>down</span>');
+  set('login', s.login_ok===null?'<span class=warn>unknown</span>':
+      s.login_ok?'<span class=ok>logged in</span>':'<span class=bad>logged out</span>');
+  set('paused', s.paused?'<span class=warn>PAUSED: '+(s.pause_reason||'')+'</span>':'<span class=ok>active</span>');
+  set('last', s.last_result||'—'); set('next', s.next_action||'—');
+  document.getElementById('log').textContent=s.events.join('\\n');
+}
+function set(id,html){document.getElementById(id).innerHTML=html;}
+function toggleControl(){
+  controlling=!controlling;
+  document.getElementById('control').style.display=controlling?'block':'none';
+  document.getElementById('shot').style.display=controlling?'block':'none';
+  document.getElementById('ctlbtn').textContent=controlling?'Stop Controlling':'Take Control';
+  if(controlling){grabShot(); shotTimer=setInterval(grabShot,2500);}
+  else clearInterval(shotTimer);
+}
+async function grabShot(){
+  const img=document.getElementById('shot');
+  img.src='/api/screenshot.png?t='+Date.now();
+}
+document.getElementById('shot').addEventListener('click',e=>{
+  const r=e.target.getBoundingClientRect();
+  post('/api/click',{x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height});
+  setTimeout(grabShot,800);
+});
+function sendText(){const t=document.getElementById('txt');post('/api/type',{text:t.value});t.value='';}
+refresh(); setInterval(refresh,5000);
+</script></body></html>
+"""
+
+===== FILE: providers/__init__.py =====
+from providers.blackhawk import BlackHawkProvider
+from providers.memorial import MemorialParkProvider
+
+PROVIDERS = {
+    'blackhawk': BlackHawkProvider(),
+    'memorial': MemorialParkProvider(),
+}
+
+
+def get_provider(name):
+    if name not in PROVIDERS:
+        raise KeyError(f"Unknown provider '{name}'. Available: {list(PROVIDERS)}")
+    return PROVIDERS[name]
+
+===== FILE: providers/base.py =====
+"""BookingProvider interface.
+
+Each golf course / booking system implements this. The scheduler and dashboard
+never know which provider they're talking to.
+
+All methods run on the browser-executor thread and receive the BrowserManager.
+"""
+
+
+class InterventionNeeded(Exception):
+    """Raise when a human must take over (CAPTCHA, unexpected page, login wall).
+    The worker pauses, sends an SMS with the dashboard link, and leaves the
+    browser exactly where it is so the user can fix it via Take Control."""
+
+
+class BookingProvider:
+    name = 'base'
+
+    def check_session(self, manager) -> bool:
+        """Cheap health check: is our session still logged in?"""
+        raise NotImplementedError
+
+    def ensure_logged_in(self, manager):
+        """Log in if needed. Raise InterventionNeeded on CAPTCHA/unexpected page."""
+        raise NotImplementedError
+
+    def attempt(self, manager, target_date, t_start, t_end, dry_run=False) -> str:
+        """One full search-and-book attempt.
+        Returns 'success' | 'no_times' | 'error'. May raise InterventionNeeded."""
+        raise NotImplementedError
+
+===== FILE: providers/blackhawk.py =====
+"""Black Hawk Country Club (EZLinks) booking provider.
+
+Selectors and Angular-scope tricks ported from the proven Selenium flow.
+"""
+
+import os
+import logging
+from datetime import datetime
+
+from playwright.sync_api import TimeoutError as PWTimeout
+
+from providers.base import BookingProvider, InterventionNeeded
+
+log = logging.getLogger('bhawk').info
+
+LOGIN_URL = 'https://www.bhawkcc.com/about-black-hawk-country-club/login?E=3'
+BOOKING_LINK_HREF = '/club/scripts/interfaces/ezlinks.asp'
+PLAYER_COUNTS = [4, 3, 2, 1]
+
+
+class BlackHawkProvider(BookingProvider):
+    name = 'blackhawk'
+
+    # ------------------------------------------------------------- session
+    def _login_form(self, page):
+        return page.locator('input#login_username_main[name="user"]')
+
+    def check_session(self, manager):
+        page = manager.page()
+        page.goto(LOGIN_URL, wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+        form = self._login_form(page)
+        return form.count() == 0 or not form.first.is_visible()
+
+    def _detect_captcha(self, page):
+        try:
+            if (page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]').count() > 0
+                    or page.locator('[class*="captcha" i]').count() > 0):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def ensure_logged_in(self, manager):
+        page = manager.page()
+        page.goto(LOGIN_URL, wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+        form = self._login_form(page)
+        if form.count() == 0 or not form.first.is_visible():
+            log("Session still valid — skipping login.")
+            return
+        if self._detect_captcha(page):
+            manager.screenshot_file(page, 'captcha_login')
+            raise InterventionNeeded("CAPTCHA on Black Hawk login page")
+        username = os.getenv('BHCC_USERNAME')
+        password = os.getenv('BHCC_PASSWORD')
+        if not username or not password:
+            raise RuntimeError("BHCC_USERNAME / BHCC_PASSWORD secrets not set")
+        log("Logging in to Black Hawk...")
+        form.first.fill(username)
+        page.fill('input#login_password_main[name="pw"]', password)
+        page.wait_for_timeout(1000)
+        page.click('button#login_submit_main[name="MemEnter"]')
+        page.wait_for_timeout(4000)
+        # Still on the login form? Bad credentials or a challenge — human needed.
+        form = self._login_form(page)
+        if form.count() > 0 and form.first.is_visible():
+            manager.screenshot_file(page, 'login_failed')
+            raise InterventionNeeded("Black Hawk login did not go through")
+        manager.screenshot_file(page, 'after_login')
+
+    # ------------------------------------------------------------- helpers
+    def _open_tee_sheet(self, manager, page):
+        log("Opening Book A Tee Time...")
+        page.click('div.nav-trigger')
+        page.wait_for_timeout(2000)
+        link = page.locator(f'a[href="{BOOKING_LINK_HREF}"]')
+        if link.count() == 0:
+            link = page.locator('a', has_text='Book A Tee Time')
+        tee = page
+        try:
+            with manager.context.expect_page(timeout=8000) as popup:
+                link.first.click()
+            tee = popup.value
+        except PWTimeout:
+            pass  # loaded in the same tab
+        tee.wait_for_load_state('domcontentloaded')
+        tee.wait_for_selector('input#dateInput', state='visible', timeout=30_000)
+        tee.wait_for_timeout(2000)
+        return tee
+
+    def _set_date(self, tee, target_date):
+        log(f"Selecting date: {target_date:%m/%d/%Y}")
+        tee.click('input#dateInput')
+        tee.wait_for_timeout(500)
+        tee.fill('input#dateInput', f'{target_date:%m/%d/%Y}')
+        tee.keyboard.press('Enter')
+        tee.wait_for_timeout(1500)
+        for day_link in tee.locator('a.ui-state-default').all():
+            if day_link.inner_text().strip() == str(target_date.day):
+                day_link.click()
+                break
+        tee.wait_for_timeout(1000)
+
+    def _wait_not_busy(self, tee, timeout=30_000):
+        try:
+            tee.wait_for_selector('div.cg-busy-animation', state='hidden', timeout=timeout)
+        except PWTimeout:
+            log("Warning: cg-busy overlay still present, proceeding...")
+        tee.wait_for_timeout(1000)
+
+    def _check_all_filters(self, tee):
+        result = tee.evaluate("""() => {
+            try {
+                var allCbs = document.querySelectorAll('input[type="checkbox"]');
+                var count = 0;
+                for (var cb of allCbs) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', {bubbles: true}));
+                    count++;
+                }
+                try {
+                    var sc = angular.element(document.body).scope();
+                    if (sc && sc.$apply) sc.$apply();
+                } catch(e2) {}
+                return 'set ' + count + ' checkboxes';
+            } catch(e) { return 'error: ' + e.message; }
+        }""")
+        log(f"Filter checkboxes: {result}")
+        self._wait_not_busy(tee, timeout=20_000)
+
+    def _set_players(self, tee, num_players):
+        span = tee.locator('span[data-ng-bind="ec.playersFilterDataBinding()"]')
+        try:
+            span.first.wait_for(state='attached', timeout=10_000)
+        except PWTimeout:
+            log("Players span not found — skipping player filter")
+            return False
+        if span.first.inner_text().strip() == str(num_players):
+            return True
+        result = span.first.evaluate("""(el, numPlayers) => {
+            try {
+                var scope;
+                for (var i = 0; i < 15; i++) {
+                    scope = angular.element(el).scope();
+                    if (scope && scope.ec) break;
+                    el = el.parentElement;
+                    if (!el) break;
+                }
+                if (!scope || !scope.ec) return 'ec not found';
+                var fs = scope.ec.filterSettings;
+                var playerKey = null;
+                for (var k of Object.keys(fs||{})) {
+                    if (k.toLowerCase().includes('player')) { playerKey = k; break; }
+                }
+                if (!playerKey) return 'no player key in: ' + Object.keys(fs||{}).join(',');
+                var old = fs[playerKey];
+                fs[playerKey] = numPlayers;
+                scope.$apply();
+                var triggered = '';
+                for (var m of ['search','doSearch','getResults','onPlayersChange',
+                               'onFilterChange','filterChanged','performSearch']) {
+                    if (typeof scope.ec[m] === 'function') {
+                        scope.ec[m](); triggered = m; break;
+                    }
+                }
+                return 'set ' + playerKey + ' ' + old + '->' + numPlayers +
+                       ' triggered:' + (triggered||'none');
+            } catch(e) { return 'error: ' + e.message; }
+        }""", num_players)
+        log(f"Players scope result: {result}")
+        self._wait_not_busy(tee, timeout=20_000)
+        return bool(result) and result.startswith('set ')
+
+    def _accept_adjustment(self, tee, timeout=1500):
+        try:
+            tee.locator(
+                "xpath=//div[contains(@class,'modal') and contains(@class,'in')]"
+                "//button[contains(., 'Yes')]").first.click(timeout=timeout)
+            log("Accepted alternative tee time (adjustment modal).")
+            return True
+        except Exception:
+            return False
+
+    def _click_any(self, tee, selectors, timeout=10_000):
+        for sel in selectors:
+            try:
+                tee.locator(sel).first.click(timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
+    # ------------------------------------------------------------- attempt
+    def attempt(self, manager, target_date, t_start, t_end, dry_run=False):
+        page = manager.page()
+        self.ensure_logged_in(manager)
+        tee = self._open_tee_sheet(manager, page)
+        self._set_date(tee, target_date)
+        tee.click("button:has-text('Search')")
+        log(f"Clicked Search at {datetime.now():%H:%M:%S.%f}")
+        self._wait_not_busy(tee)
+        self._check_all_filters(tee)
+
+        candidates, players_used = [], None
+        for n in PLAYER_COUNTS:
+            if not self._set_players(tee, n):
+                continue
+            try:
+                tee.wait_for_selector('span.time.ng-binding', timeout=15_000)
+            except PWTimeout:
+                pass
+            times = [t.inner_text().strip()
+                     for t in tee.locator('span.time.ng-binding').all()]
+            log(f"{len(times)} slot(s) with {n} players: {times}")
+            for i, txt in enumerate(times):
+                try:
+                    t = datetime.strptime(txt, '%I:%M %p')
+                    hour_dec = t.hour + t.minute / 60.0
+                    if t_start <= hour_dec < t_end:
+                        candidates.append((hour_dec, i, txt))
+                except ValueError:
+                    pass
+            if candidates:
+                players_used = n
+                break
+
+        if not candidates:
+            log("No tee times in window for any player count.")
+            manager.screenshot_file(tee, 'no_times')
+            return 'no_times'
+
+        candidates.sort(key=lambda c: c[0])  # earliest inside the window
+        hour_dec, idx, txt = candidates[0]
+        view_buttons = tee.locator(
+            "xpath=//button[contains(@class,'primary-btn') and contains(text(),'View')]")
+        if idx >= view_buttons.count():
+            log("View button index out of range — page changed under us.")
+            return 'error'
+        log(f"Selecting {txt} ({players_used} players)")
+        view_buttons.nth(idx).click()
+        tee.wait_for_timeout(3000)
+
+        self._accept_adjustment(tee, timeout=1000)
+        cart_selectors = ['button#addToCartBtn',
+                          "xpath=//button[contains(., 'Continue') and not(@disabled)]"]
+        clicked = self._click_any(tee, cart_selectors)
+        if not clicked and self._accept_adjustment(tee, timeout=2000):
+            clicked = self._click_any(tee, cart_selectors)
+        if not clicked:
+            manager.screenshot_file(tee, 'cart_continue_not_found')
+            return 'error'
+        tee.wait_for_timeout(3000)
+        self._accept_adjustment(tee, timeout=1000)
+
+        log("Proceeding through payment page...")
+        if not self._click_any(tee, [
+            'button#buyTeeTime.tokenex_submit',
+            'button#buyTeeTime',
+            "xpath=//button[contains(., 'Continue') and not(@disabled)]",
+            "xpath=//a[contains(., 'Continue')]",
+        ], timeout=25_000):
+            manager.screenshot_file(tee, 'payment_continue_not_found')
+            return 'error'
+        tee.wait_for_timeout(3000)
+
+        if dry_run:
+            log("DRY RUN — stopping before Finish. Flow works end to end.")
+            manager.screenshot_file(tee, 'dry_run_final_page')
+            return 'success'
+
+        log("Finalizing reservation...")
+        if not self._click_any(tee, [
+            'button#topFinishBtn',
+            "xpath=//button[contains(., 'Finish') and not(@disabled)]",
+            "xpath=//button[contains(., 'Complete') and not(@disabled)]",
+            "xpath=//button[contains(., 'Reserve') and not(@disabled)]",
+        ], timeout=25_000):
+            manager.screenshot_file(tee, 'finish_button_not_found')
+            return 'error'
+        tee.wait_for_timeout(5000)
+
+        content = tee.content().lower()
+        if any(s in content for s in ('reservation complete', 'confirmation', 'thank you')):
+            log(f"SUCCESS! Booked {txt} on {target_date:%Y-%m-%d} "
+                f"for {players_used} players.")
+            manager.screenshot_file(tee, 'reservation_confirmation')
+            return 'success'
+        log("WARNING: reservation may not have completed — check manually.")
+        manager.screenshot_file(tee, 'final_page')
+        return 'error'
+
+===== FILE: providers/memorial.py =====
+"""Memorial Park (Houston) booking provider — SCAFFOLD, not yet implemented.
+
+To fill this in, someone needs to walk the real Memorial Park booking flow
+(golf course website -> tee time search -> reserve) with browser devtools open
+and record:
+  1. The login URL and the login form field selectors.
+  2. How to reach the tee sheet for a given date.
+  3. The selectors for time slots, player count, and the reserve/confirm buttons.
+  4. What the "already logged in" state looks like (for check_session).
+
+Then implement the three methods below exactly like providers/blackhawk.py.
+The scheduler, dashboard, SMS, and browser management all work unchanged —
+entries in booking_config.json just need "provider": "memorial".
+"""
+
+import logging
+
+from providers.base import BookingProvider
+
+log = logging.getLogger('bhawk').info
+
+
+class MemorialParkProvider(BookingProvider):
+    name = 'memorial'
+
+    def check_session(self, manager):
+        log("Memorial Park provider not implemented yet.")
+        return False
+
+    def ensure_logged_in(self, manager):
+        raise NotImplementedError(
+            "Memorial Park provider is a scaffold — record the booking flow "
+            "and implement selectors (see module docstring).")
+
+    def attempt(self, manager, target_date, t_start, t_end, dry_run=False):
+        raise NotImplementedError(
+            "Memorial Park provider is a scaffold — record the booking flow "
+            "and implement selectors (see module docstring).")
+
+===== FILE: README.md =====
+# Golf Tee Time Booking Service
+
+A continuously-running booking service (V1: personal, single-user) hosted on
+Replit. One persistent Chromium browser stays logged in 24/7; a scheduler
+snipes tee times the moment they open and polls for cancellations; SMS alerts
+keep you in the loop; and a phone-friendly dashboard lets you watch the live
+browser and take control when a CAPTCHA or login wall needs a human.
+
+## Architecture
+
+```
+server.py                 entrypoint: starts everything
+├── browser.py            ONE persistent Playwright Chromium (cookies survive
+│                         restarts via .pw-bhcc-profile/); all browser work
+│                         runs on a single executor thread
+├── worker.py             scheduler: 7:00 AM snipes, cancellation polling,
+│                         30-min session health checks, pause/resume
+├── providers/
+│   ├── base.py           BookingProvider interface + InterventionNeeded
+│   ├── blackhawk.py      Black Hawk CC (EZLinks) — fully implemented
+│   └── memorial.py       Memorial Park Houston — scaffold (see file docstring)
+├── web.py                FastAPI dashboard (status, logs, live view,
+│                         click/type passthrough, pause/resume/restart)
+├── notify.py             Twilio SMS (log-only until secrets are set)
+└── status.py             shared state, config, booked-date tracking
+```
+
+## Replit setup
+
+1. Create a blank **Python** Repl → upload the package zip → extract
+   (`unzip *.zip` in the Shell if needed).
+2. Shell: `pip install -r requirements.txt`
+   ([replit.nix](replit.nix) provides system Chromium automatically).
+3. **Secrets** (Tools → Secrets):
+
+   | Secret | Required | Purpose |
+   |---|---|---|
+   | `BHCC_USERNAME` / `BHCC_PASSWORD` | yes | Black Hawk login |
+   | `DASHBOARD_PASSWORD` | yes | dashboard auth (it fails closed without it) |
+   | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` / `SMS_TO` | for SMS | Twilio credentials + your phone number |
+   | `DASHBOARD_URL` | recommended | your deployed URL, appended to alert texts |
+   | `DRY_RUN` | first test | `true` = stop right before the final Finish click |
+
+4. Hit **Run** — open the webview, log in with any username + your
+   `DASHBOARD_PASSWORD`.
+5. When happy: **Deploy → Reserved VM → Web Server**. (Autoscale sleeps
+   between requests and kills the browser; Reserved VM keeps it alive.)
+   Put the deployment URL in the `DASHBOARD_URL` secret.
+
+## booking_config.json
+
+```json
+{
+  "provider": "blackhawk",
+  "recurring": [
+    { "day": "friday",   "time_start": 9.5, "time_end": 10.5 }
+  ],
+  "target_dates": [
+    { "date": "2026-08-01", "time_start": 9.0, "time_end": 12.0 }
+  ]
+}
+```
+
+- **recurring** → snipe mode: 8 days before each matching date (`DAYS_AHEAD`),
+  the worker warms up the session at ~6:54 AM Central, fires at 7:00:00, then
+  retries every 20–45 s for 20 minutes. SMS on success or failure.
+- **target_dates** → poll mode: re-searches every 3–7 minutes for
+  cancellations. Times are decimal hours (9.5 = 9:30 AM).
+- Per-entry `"provider"` overrides the top-level one (for Memorial Park later).
+- Config is re-read every loop — edit it live, no restart needed.
+- Booked dates land in `logs/booked_dates.json` and are never re-booked.
+
+## Human-in-the-loop
+
+When the provider hits a CAPTCHA or an unexpected login wall it raises
+`InterventionNeeded`: the worker pauses, texts you the dashboard link, and
+leaves the browser exactly where it is. On the dashboard, **Take Control**
+shows a live screenshot — tap to click, type into the text box — solve the
+challenge yourself, then hit **Resume**. Nothing restarts; the same browser
+session continues.
+
+## Bot-detection design
+
+- One long-lived browser + persistent profile → login cookies stay warm,
+  logins are rare (the #1 flag is a fresh login every run).
+- Headless User-Agent masked, `navigator.webdriver` hidden, automation blink
+  feature disabled.
+- Randomized retry/poll intervals.
+- **Caveat:** Replit egress uses datacenter IPs. If EZLinks blocks by IP
+  reputation, browser stealth can't fix that — the fallback is running this
+  same service on a home machine (it's plain Python, nothing Replit-specific).
+
+## Memorial Park (V2 first step)
+
+[providers/memorial.py](providers/memorial.py) is a scaffold. To implement it,
+walk the real Memorial Park booking flow once with devtools open, record the
+login/search/reserve selectors, and fill in the three methods following
+[providers/blackhawk.py](providers/blackhawk.py) as the template. Everything
+else (scheduler, dashboard, SMS, browser) already works for any provider.
+
+## Legacy
+
+`book_tee_time.py` is the old single-run Selenium/launchd version for the Mac.
+It still works but is superseded by this service.
+
