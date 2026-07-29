@@ -45,9 +45,19 @@ TARGET_TIME_END = 10.5   # 10:30 AM
 BOOKING_HOUR = 7  # Tee times open at 7 AM
 BOOKING_MINUTE = 0
 DAYS_AHEAD = int(os.getenv('DAYS_AHEAD', '8'))  # Book 8 days in advance by default
+# How many minutes before 7:00 AM to start logging in. On a cloud runner the job
+# may start many minutes early, so we deliberately hold off on login until just
+# before the drop — this keeps the ezlinks session fresh right up to the click.
+LOGIN_LEAD_MINUTES = int(os.getenv('LOGIN_LEAD_MINUTES', '3'))
 
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
+
+# Dry run: log in, open the booking page, run a search and list the available
+# times — but STOP before reserving anything. Ignores the day/time schedule and
+# the 7:00 AM wait so you can validate login + navigation on any day. Set via the
+# DRY_RUN env var (used by the workflow's manual "Run workflow" button).
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 # Config file for scheduled target dates.
 # Prefer project root config, then fallback to logs/ for backwards compatibility.
@@ -132,6 +142,30 @@ def should_book_today():
     log(f"No booking scheduled for {target_str} ({target.strftime('%A')}). Skipping.")
     return None
 
+def wait_until_login_time():
+    """
+    Hold off until LOGIN_LEAD_MINUTES before 7:00 AM before we log in.
+
+    Cloud schedulers (e.g. GitHub Actions) can start a job several minutes
+    early or late, so we don't want to log in the moment the runner boots and
+    then sit on a stale session for 20+ minutes. Instead we sleep until just
+    before the drop, log in fresh, and let wait_until_booking_time() handle the
+    final precise wait. Returns immediately if we're already inside the window.
+    """
+    now = datetime.now()
+    login_target = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE,
+                               second=0, microsecond=0) - timedelta(minutes=LOGIN_LEAD_MINUTES)
+
+    if now >= login_target:
+        log(f"Already within {LOGIN_LEAD_MINUTES} min of {BOOKING_HOUR}:00 AM, logging in now...")
+        return
+
+    wait_seconds = (login_target - now).total_seconds()
+    log(f"Waiting {wait_seconds:.0f}s until {login_target.strftime('%H:%M:%S')} "
+        f"({LOGIN_LEAD_MINUTES} min before the drop) to begin login...")
+    time.sleep(wait_seconds)
+    log("Login window reached — starting login now.")
+
 def wait_until_booking_time():
     """
     Wait until exactly 7:00:00 AM to click search.
@@ -165,6 +199,25 @@ def save_screenshot(driver, name):
     driver.save_screenshot(filepath)
     log(f"Screenshot saved: {filepath}")
     return filepath
+
+def save_page_source(driver, name):
+    """Dump the current page HTML so selector breakage is diagnosable later.
+
+    A screenshot shows *that* something looks wrong; the HTML shows *why* (e.g.
+    the button's id/class changed). Saved next to the screenshots so it rides
+    along in the uploaded artifact. Never raises — diagnostics must not mask the
+    original error.
+    """
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        filepath = os.path.join(SCREENSHOT_DIR, f'{name}_{timestamp}.html')
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(driver.page_source)
+        log(f"Page HTML saved: {filepath}  (current URL: {driver.current_url})")
+        return filepath
+    except Exception as e:
+        log(f"Could not save page HTML ({name}): {e}")
+        return None
 
 def wait_and_click(driver, by, value, timeout=30):
     """Wait for element and click it, with interception fallback."""
@@ -253,12 +306,28 @@ def book_tee_time():
 
     result = should_book_today()
     if result is None:
-        log("Nothing to book today. Exiting.")
-        return True  # Not an error, just no booking scheduled
+        if DRY_RUN:
+            # No real booking scheduled, but in a dry run we still want to
+            # exercise login + navigation. Target the far edge of the booking
+            # window (today + DAYS_AHEAD) with a full-day time window.
+            target = calculate_target_date()
+            result = (target, 0, 24)
+            log(f"DRY_RUN: nothing scheduled today; testing navigation for "
+                f"{target.strftime('%A, %B %d, %Y')} with a full-day window.")
+        else:
+            log("Nothing to book today. Exiting.")
+            return True  # Not an error, just no booking scheduled
 
     target_date, time_start, time_end = result
     log(f"Target date: {target_date.strftime('%A, %B %d, %Y')}")
     log(f"Time window: {time_start}:00 - {time_end}:00")
+    if DRY_RUN:
+        log("*** DRY RUN — will search and list times but NOT reserve anything. ***")
+
+    # Hold off on login until just before 7:00 AM so the session stays fresh.
+    # Skipped in a dry run so the test doesn't hang until the morning.
+    if not DRY_RUN:
+        wait_until_login_time()
 
     # Configure undetected Chrome
     log("Launching browser with undetected-chromedriver...")
@@ -378,9 +447,11 @@ def book_tee_time():
                 "//button[contains(normalize-space(.), 'Search All')]",
             ))
         )
-        log("Search button ready, waiting for 7:00 AM...")
-
-        wait_until_booking_time()
+        if DRY_RUN:
+            log("DRY_RUN: skipping the 7:00 AM wait — searching immediately.")
+        else:
+            log("Search button ready, waiting for 7:00 AM...")
+            wait_until_booking_time()
 
         try:
             search_button.click()
@@ -403,6 +474,7 @@ def book_tee_time():
         except TimeoutException:
             log("Warning: Tee time elements took longer than expected to load...")
             save_screenshot(driver, 'search_timeout')
+            save_page_source(driver, 'search_timeout')
             time.sleep(10)
             page_text = driver.find_element(By.TAG_NAME, 'body').text
             log(f"Page text excerpt: {page_text[:500]}")
@@ -414,6 +486,19 @@ def book_tee_time():
         log(f"Looking for tee times between {time_start}:00 and {time_end}:00...")
 
         time_spans = driver.find_elements(By.CSS_SELECTOR, 'span.time.ng-binding')
+
+        # In a dry run, report what we found and stop before reserving anything.
+        if DRY_RUN:
+            found_times = [s.text.strip() for s in time_spans if s.text.strip()]
+            if found_times:
+                log(f"DRY RUN SUCCESS: login + navigation + search all worked. "
+                    f"Found {len(found_times)} tee times: {', '.join(found_times)}")
+            else:
+                log("DRY RUN: reached the results page but found no listed times "
+                    "(could be a date with no availability). Check the screenshot.")
+            save_screenshot(driver, 'dry_run_results')
+            return True
+
         view_buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'primary-btn') and contains(text(), 'View')]")
 
         found_time = False
@@ -443,6 +528,7 @@ def book_tee_time():
         if not found_time:
             log("ERROR: No available tee times found in the target window!")
             save_screenshot(driver, 'no_times_available')
+            save_page_source(driver, 'no_times_available')
             return False
 
         # Step 8: Handle popup - click Continue
@@ -516,6 +602,7 @@ def book_tee_time():
     except TimeoutException as e:
         log(f"ERROR: Timeout occurred - {str(e)}")
         save_screenshot(driver, 'error_timeout')
+        save_page_source(driver, 'error_timeout')
         return False
     except Exception as e:
         log(f"ERROR: {str(e)}")
@@ -523,6 +610,7 @@ def book_tee_time():
         traceback.print_exc()
         try:
             save_screenshot(driver, 'error_exception')
+            save_page_source(driver, 'error_exception')
         except Exception:
             pass
         return False
