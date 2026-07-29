@@ -9,12 +9,15 @@ name: Book Tee Time
 on:
   schedule:
     # Fires Fridays. Two entries cover Central daylight (CDT) and standard (CST)
-    # time so the real run always lands in the local 6 o'clock hour year-round.
-    # A guard step below skips the "wrong season" firing.
-    #   25 11 UTC = 6:25 CDT (summer)  |  5:25 CST (winter -> skipped)
-    #   25 12 UTC = 7:25 CDT (skipped) |  6:25 CST (winter)
-    - cron: "25 11 * * 5"
-    - cron: "25 12 * * 5"
+    # time so the real run always lands early in the local 6 o'clock hour
+    # year-round. A guard step below skips the "wrong season" firing.
+    # Scheduled early (~6:05) on purpose: GitHub cron routinely starts jobs
+    # 5-40 minutes late, and the bot itself sleeps until 6:57 to log in and
+    # fires at exactly 7:00:00 — so a big head start costs nothing.
+    #   05 11 UTC = 6:05 CDT (summer)  |  5:05 CST (winter -> skipped)
+    #   05 12 UTC = 7:05 CDT (skipped) |  6:05 CST (winter)
+    - cron: "05 11 * * 5"
+    - cron: "05 12 * * 5"
   # Manual "Run workflow" button — bypasses the day/hour guard, so you can test
   # anytime or trigger a booking by hand if a scheduled run ever gets skipped.
   workflow_dispatch:
@@ -32,7 +35,9 @@ concurrency:
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Must comfortably cover: sleep from a ~6:05 start to the 7:00 drop, plus
+    # the booking flow itself. 30 min was a bug — it killed the job before 7:00.
+    timeout-minutes: 90
     env:
       TZ: America/Chicago            # all times in the bot are now Central
       HEADLESS: "false"              # visible Chrome under Xvfb
@@ -46,19 +51,27 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Gate scheduled runs to Friday ~6 AM Central
+      - name: Gate to the correct seasonal firing
         id: gate
+        # The only job of this guard is to skip the wrong-season duplicate cron.
+        # It must NOT look at the clock: GitHub often starts scheduled jobs
+        # 5-40 minutes late, and an hour-based check would silently skip a
+        # late-but-perfectly-bookable run. Matching the cron expression against
+        # the current timezone abbreviation is delay-proof.
         run: |
-          DOW=$(date +%u)   # 5 = Friday
-          HOUR=$(date +%H)  # local hour (TZ=America/Chicago)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run — skipping the day/hour guard."
+            echo "Manual run — skipping the schedule guard."
             echo "proceed=true" >> "$GITHUB_OUTPUT"
-          elif [ "$DOW" = "5" ] && [ "$HOUR" = "06" ]; then
-            echo "Friday $HOUR:00 Central — proceeding."
+            exit 0
+          fi
+          ZONE=$(date +%Z)   # CDT in summer, CST in winter (TZ=America/Chicago)
+          SCHED="${{ github.event.schedule }}"
+          if { [ "$SCHED" = "05 11 * * 5" ] && [ "$ZONE" = "CDT" ]; } || \
+             { [ "$SCHED" = "05 12 * * 5" ] && [ "$ZONE" = "CST" ]; }; then
+            echo "Correct seasonal firing (cron '$SCHED', zone $ZONE) — proceeding."
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Not the intended window (DOW=$DOW HOUR=$HOUR CT). Skipping this firing."
+            echo "Wrong-season firing (cron '$SCHED', zone $ZONE) — skipping."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           fi
 
