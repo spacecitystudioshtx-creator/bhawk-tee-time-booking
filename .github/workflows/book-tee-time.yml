@@ -13,7 +13,7 @@ on:
     # entirely (on 2026-07-31 BOTH scheduled firings were silently dropped —
     # zero runs). So we schedule six staggered firings; every one of them
     # lands before the 7:00 AM Central drop in its season, the bot sleeps
-    # until 6:57, logs in, and clicks Search at exactly 7:00:00. Whichever
+    # until 6:57, logs in, and clicks Search at 7:00:01. Whichever
     # firing actually starts first does the booking; a dedupe check in the
     # gate step makes every later firing a no-op once one has succeeded, and
     # the concurrency group serializes any overlap. Odd minutes on purpose:

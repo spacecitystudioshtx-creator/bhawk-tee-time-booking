@@ -44,6 +44,11 @@ TARGET_TIME_START = 9  # 9 AM
 TARGET_TIME_END = 10.5   # 10:30 AM
 BOOKING_HOUR = 7  # Tee times open at 7 AM
 BOOKING_MINUTE = 0
+# Click Search this many seconds AFTER 7:00:00, not at 7:00:00 sharp. A search
+# fired exactly on the hour can land a beat before the site has actually
+# released the inventory (clock skew / release job still running) and comes
+# back "0 tee times" — the 2026-08-07 7:00:00.08 click did exactly that.
+BOOKING_SECOND = int(os.getenv('BOOKING_SECOND', '1'))
 DAYS_AHEAD = int(os.getenv('DAYS_AHEAD', '8'))  # Book 8 days in advance by default
 # How many minutes before 7:00 AM to start logging in. On a cloud runner the job
 # may start many minutes early, so we deliberately hold off on login until just
@@ -177,28 +182,31 @@ def wait_until_login_time():
 
 def wait_until_booking_time():
     """
-    Wait until exactly 7:00:00 AM to click search.
-    Returns immediately if already past 7 AM.
+    Wait until BOOKING_SECOND seconds past 7:00 AM to click search (7:00:01 by
+    default — clicking at 7:00:00 sharp can beat the release itself).
+    Returns immediately if already past that moment.
     """
     now = datetime.now()
-    target_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
+    target_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE,
+                              second=BOOKING_SECOND, microsecond=0)
 
     if now >= target_time:
         log(f"Already past {BOOKING_HOUR}:00 AM, proceeding immediately...")
         return
 
     wait_seconds = (target_time - now).total_seconds()
-    log(f"Waiting {wait_seconds:.1f} seconds until {BOOKING_HOUR}:00:00 AM...")
+    log(f"Waiting {wait_seconds:.1f} seconds until "
+        f"{target_time.strftime('%H:%M:%S')} AM...")
 
     # Wait until 1 second before, then do precise timing
     if wait_seconds > 1:
         time.sleep(wait_seconds - 1)
 
-    # Precise wait for the final second
+    # Precise wait for the final stretch
     while datetime.now() < target_time:
         time.sleep(0.01)  # 10ms precision
 
-    log(f"It's {BOOKING_HOUR}:00 AM - GO!")
+    log(f"It's {target_time.strftime('%H:%M:%S')} - GO!")
 
 def save_screenshot(driver, name):
     """Save a screenshot with timestamp to the screenshots directory"""
