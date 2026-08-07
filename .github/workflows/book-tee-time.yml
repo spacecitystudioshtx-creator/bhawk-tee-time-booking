@@ -44,9 +44,11 @@ jobs:
   book:
     runs-on: ubuntu-latest
     # Must comfortably cover the sleep from the earliest winter firing
-    # (4:34 AM Central) to the 7:00 drop, plus the booking flow itself.
+    # (4:34 AM Central) to the 7:00 drop (~146 min), plus the bot's
+    # post-drop search-retry window (SEARCH_RETRY_MINUTES, default 30),
+    # plus the booking flow itself.
     # Sleeping runner minutes are free on a public repo.
-    timeout-minutes: 170
+    timeout-minutes: 210
     env:
       TZ: America/Chicago            # all times in the bot are now Central
       HEADLESS: "false"              # visible Chrome under Xvfb

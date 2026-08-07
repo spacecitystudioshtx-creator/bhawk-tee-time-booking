@@ -50,6 +50,15 @@ DAYS_AHEAD = int(os.getenv('DAYS_AHEAD', '8'))  # Book 8 days in advance by defa
 # before the drop — this keeps the ezlinks session fresh right up to the click.
 LOGIN_LEAD_MINUTES = int(os.getenv('LOGIN_LEAD_MINUTES', '3'))
 
+# How long to keep re-running the search after the 7:00 AM drop before giving
+# up, and how long to pause between attempts. On 2026-08-07 the search clicked
+# at 7:00:00.08 came back "0 tee times" for the whole day with a stuck
+# "Please Wait..." spinner — right at the drop the site lags under load and
+# inventory can post seconds-to-minutes late — and the bot's single search
+# meant it walked away while slots were appearing. Re-searching is what wins.
+SEARCH_RETRY_MINUTES = float(os.getenv('SEARCH_RETRY_MINUTES', '30'))
+SEARCH_RETRY_PAUSE_SECONDS = float(os.getenv('SEARCH_RETRY_PAUSE_SECONDS', '10'))
+
 # Set to True when running on server (headless mode)
 HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
 
@@ -300,6 +309,74 @@ def accept_adjustment_if_present(driver, timeout=2):
     except TimeoutException:
         return False
 
+def set_search_date(driver, target_date_str):
+    """Set the search date through Angular's $scope.
+
+    The form is the new ezlinks Angular SPA where ec.startDate is a STRING in
+    MM/DD/YYYY format. Typing into the input + Enter triggers an immediate
+    search before we want it (the form's submit handler runs on Enter), so we
+    bypass typing entirely and assign the model.
+    """
+    return driver.execute_script(
+        """
+        var dateStr = arguments[0];
+        var input = document.getElementById('dateInput');
+        if (!input) return {err: 'no-input'};
+        if (!window.angular) return {err: 'no-angular'};
+        var scope = angular.element(input).scope();
+        if (!scope || !scope.ec) return {err: 'no-scope-ec'};
+        scope.$apply(function() {
+            scope.ec.startDate = dateStr;
+            if (typeof scope.ec.onDateChanged === 'function') {
+                scope.ec.onDateChanged(scope.ec.startDate);
+            }
+        });
+        return {
+            ok: true,
+            startDate: String(scope.ec.startDate || ''),
+            enableSearchButton: !!scope.ec.enableSearchButton
+        };
+        """,
+        target_date_str,
+    )
+
+def rerun_search(driver, target_date_str):
+    """Reload the booking page and run a fresh search.
+
+    Reload rather than re-click in place: the results page can wedge on its
+    "Please Wait..." spinner and never recover without a fresh page. The SSO
+    redirect reuses the logged-in bhawkcc session, so this lands straight on
+    preSearch. Returns True if the search was re-run, False if the page never
+    became ready (caller should just try again).
+    """
+    driver.get('https://www.bhawkcc.com/club/scripts/interfaces/ezlinks.asp')
+    time.sleep(3)
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 'input#dateInput'))
+        )
+    except TimeoutException:
+        log("Warning: Date input not ready on retry; will reload and try again...")
+        return False
+    set_search_date(driver, target_date_str)
+    time.sleep(1)
+    try:
+        search_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//button[contains(normalize-space(.), 'Search All')]",
+            ))
+        )
+    except TimeoutException:
+        log("Warning: Search All button not found on retry; will reload and try again...")
+        return False
+    try:
+        search_button.click()
+    except ElementClickInterceptedException:
+        driver.execute_script("arguments[0].click();", search_button)
+    log("Re-ran search at " + datetime.now().strftime('%H:%M:%S.%f'))
+    return True
+
 def book_tee_time():
     """Main function to book tee time"""
     log("Starting tee time booking automation...")
@@ -406,35 +483,10 @@ def book_tee_time():
         time.sleep(2)
         log("Successfully opened booking page...")
 
-        # Step 5: Set the date through Angular's $scope.
-        # The form is the new ezlinks Angular SPA where ec.startDate is a STRING
-        # in MM/DD/YYYY format. Typing into the input + Enter triggers an
-        # immediate search before we want it (the form's submit handler runs
-        # on Enter), so we bypass typing entirely and assign the model.
+        # Step 5: Set the date through Angular's $scope (see set_search_date).
         target_date_str = target_date.strftime('%m/%d/%Y')
         log(f"Setting ec.startDate = {target_date_str} via $scope")
-        result = driver.execute_script(
-            """
-            var dateStr = arguments[0];
-            var input = document.getElementById('dateInput');
-            if (!input) return {err: 'no-input'};
-            if (!window.angular) return {err: 'no-angular'};
-            var scope = angular.element(input).scope();
-            if (!scope || !scope.ec) return {err: 'no-scope-ec'};
-            scope.$apply(function() {
-                scope.ec.startDate = dateStr;
-                if (typeof scope.ec.onDateChanged === 'function') {
-                    scope.ec.onDateChanged(scope.ec.startDate);
-                }
-            });
-            return {
-                ok: true,
-                startDate: String(scope.ec.startDate || ''),
-                enableSearchButton: !!scope.ec.enableSearchButton
-            };
-            """,
-            target_date_str,
-        )
+        result = set_search_date(driver, target_date_str)
         log(f"Scope set result: {result}")
         time.sleep(1.5)
         save_screenshot(driver, 'after_date_set')
@@ -459,77 +511,102 @@ def book_tee_time():
             driver.execute_script("arguments[0].click();", search_button)
         log("Clicked search at " + datetime.now().strftime('%H:%M:%S.%f'))
 
-        # Wait for results
-        log("Waiting for search results to load...")
-        time.sleep(3)
-        log(f"Current URL after search: {driver.current_url}")
-        save_screenshot(driver, 'after_search_click')
-
-        # Wait for tee times to appear (up to 60 seconds)
-        try:
-            WebDriverWait(driver, 60).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'span.time.ng-binding'))
-            )
-            log("Tee times loaded successfully!")
-        except TimeoutException:
-            log("Warning: Tee time elements took longer than expected to load...")
-            save_screenshot(driver, 'search_timeout')
-            save_page_source(driver, 'search_timeout')
-            time.sleep(10)
-            page_text = driver.find_element(By.TAG_NAME, 'body').text
-            log(f"Page text excerpt: {page_text[:500]}")
-
-        # Screenshot the search results for debugging
-        save_screenshot(driver, 'search_results')
-
-        # Step 7: Find and click View for first available time in desired window
-        log(f"Looking for tee times between {time_start}:00 and {time_end}:00...")
-
-        time_spans = driver.find_elements(By.CSS_SELECTOR, 'span.time.ng-binding')
-
-        # In a dry run, report what we found and stop before reserving anything.
-        if DRY_RUN:
-            found_times = [s.text.strip() for s in time_spans if s.text.strip()]
-            if found_times:
-                log(f"DRY RUN SUCCESS: login + navigation + search all worked. "
-                    f"Found {len(found_times)} tee times: {', '.join(found_times)}")
-            else:
-                log("DRY RUN: reached the results page but found no listed times "
-                    "(could be a date with no availability). Check the screenshot.")
-            save_screenshot(driver, 'dry_run_results')
-            return True
-
-        view_buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'primary-btn') and contains(text(), 'View')]")
-
+        # Step 7: Find a time in the desired window, RE-RUNNING the search
+        # until one appears or the retry window closes. A single search right
+        # at 7:00:00 routinely comes back empty (site lagging under the drop
+        # rush, inventory posting late), so walking away after one look loses
+        # the morning — see the 2026-08-07 run.
+        retry_deadline = datetime.now() + timedelta(minutes=SEARCH_RETRY_MINUTES)
+        attempt = 0
         found_time = False
 
-        for i, time_span in enumerate(time_spans):
+        while True:
+            attempt += 1
+
+            # Wait for results
+            log("Waiting for search results to load...")
+            time.sleep(3)
+            log(f"Current URL after search: {driver.current_url}")
+            if attempt == 1:
+                save_screenshot(driver, 'after_search_click')
+
+            # Wait for tee times to appear
             try:
-                time_text = time_span.text.strip()
+                WebDriverWait(driver, 60 if attempt == 1 else 30).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'span.time.ng-binding'))
+                )
+                log("Tee times loaded successfully!")
+            except TimeoutException:
+                log("Warning: Tee time elements took longer than expected to load...")
+                if attempt == 1:
+                    save_screenshot(driver, 'search_timeout')
+                    save_page_source(driver, 'search_timeout')
+                    time.sleep(10)
+                    page_text = driver.find_element(By.TAG_NAME, 'body').text
+                    log(f"Page text excerpt: {page_text[:500]}")
 
-                # Parse the time
-                time_obj = datetime.strptime(time_text, '%I:%M %p')
-                hour_decimal = time_obj.hour + time_obj.minute / 60.0
+            if attempt == 1:
+                # Screenshot the search results for debugging
+                save_screenshot(driver, 'search_results')
 
-                # Check if time is in target window
-                if time_start <= hour_decimal < time_end:
-                    log(f"Found available time: {time_text}")
+            log(f"Looking for tee times between {time_start}:00 and {time_end}:00 "
+                f"(attempt {attempt})...")
 
-                    # Click the corresponding View button
-                    if i < len(view_buttons):
-                        view_buttons[i].click()
-                        found_time = True
-                        time.sleep(3)
-                        break
-            except Exception as e:
-                log(f"Error parsing time at index {i}: {e}")
-                continue
+            time_spans = driver.find_elements(By.CSS_SELECTOR, 'span.time.ng-binding')
 
-        if not found_time:
-            log("ERROR: No available tee times found in the target window!")
-            save_screenshot(driver, 'no_times_available')
-            save_page_source(driver, 'no_times_available')
-            return False
+            # In a dry run, report what we found and stop before reserving
+            # anything — no retry loop, one look is the point of the test.
+            if DRY_RUN:
+                found_times = [s.text.strip() for s in time_spans if s.text.strip()]
+                if found_times:
+                    log(f"DRY RUN SUCCESS: login + navigation + search all worked. "
+                        f"Found {len(found_times)} tee times: {', '.join(found_times)}")
+                else:
+                    log("DRY RUN: reached the results page but found no listed times "
+                        "(could be a date with no availability). Check the screenshot.")
+                save_screenshot(driver, 'dry_run_results')
+                return True
+
+            view_buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'primary-btn') and contains(text(), 'View')]")
+
+            for i, time_span in enumerate(time_spans):
+                try:
+                    time_text = time_span.text.strip()
+
+                    # Parse the time
+                    time_obj = datetime.strptime(time_text, '%I:%M %p')
+                    hour_decimal = time_obj.hour + time_obj.minute / 60.0
+
+                    # Check if time is in target window
+                    if time_start <= hour_decimal < time_end:
+                        log(f"Found available time: {time_text}")
+
+                        # Click the corresponding View button
+                        if i < len(view_buttons):
+                            view_buttons[i].click()
+                            found_time = True
+                            time.sleep(3)
+                            break
+                except Exception as e:
+                    log(f"Error parsing time at index {i}: {e}")
+                    continue
+
+            if found_time:
+                break
+
+            if datetime.now() >= retry_deadline:
+                log(f"ERROR: No available tee times found in the target window "
+                    f"after {attempt} search attempts over {SEARCH_RETRY_MINUTES:g} minutes!")
+                save_screenshot(driver, 'no_times_available')
+                save_page_source(driver, 'no_times_available')
+                return False
+
+            log(f"No times in the window yet ({len(time_spans)} listed overall). "
+                f"Re-running the search in {SEARCH_RETRY_PAUSE_SECONDS:g}s...")
+            time.sleep(SEARCH_RETRY_PAUSE_SECONDS)
+            # If the reload itself wedges, loop back around — the deadline
+            # check above still bounds the total time spent.
+            rerun_search(driver, target_date_str)
 
         # Step 8: Handle popup - click Continue
         # If the first slot was taken, accept replacement immediately.
