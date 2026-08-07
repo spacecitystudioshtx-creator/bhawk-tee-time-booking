@@ -6,7 +6,8 @@ Automated tee time booking for Black Hawk Country Club. Runs headless via `launc
 
 - LaunchAgent fires at **6:50 AM** on Thursdays and Fridays
 - Bot logs in, navigates to the booking page, fills in the target date (+8 days ahead)
-- Waits until exactly **7:00 AM** (when tee times open), then clicks Search
+- Waits until **7:00:01 AM** (one second after tee times open, so the search can't beat the release), then clicks Search
+- If no times show up in the window, keeps re-running the search (every ~10s, for up to 30 min) — right at the drop the site often lags and inventory posts late, so a single search can come back "0 tee times"
 - Selects the first available time in the configured window and completes the reservation
 
 ## Schedule
